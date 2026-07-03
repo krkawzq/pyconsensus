@@ -15,3 +15,9 @@ target/
 docs/
 forks/
 libs/
+
+# Build artifacts (native extensions, object files, archives)
+*.so
+*.o
+*.a
+*.dylib
