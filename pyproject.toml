@@ -3,14 +3,24 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "pyconsensus"
+# PyPI distribution name is "py-consensus" (the bare "pyconsensus" name on PyPI
+# is taken by an unrelated Augur project). The Python import name stays
+# "pyconsensus" — see [tool.maturin].module-name / python-source below.
+name = "py-consensus"
 version = "0.1.0"
 description = "Rust rewrite of bcftools consensus for online enformer expression data"
 license = "MIT"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 

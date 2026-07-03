@@ -72,14 +72,6 @@ pub fn plan_region(records: &[&VcfRecord], opts: PlanOptions) -> RegionPlan {
     if opts.mask {
         return RegionPlan::needs_fallback(FallbackReason::MaskOverlap, records.len());
     }
-    if opts.has_mark()
-        && records
-            .iter()
-            .any(|r| r.compiled.flags.contains(RecordFlags::HAS_LEN_CHANGE))
-    {
-        return RegionPlan::needs_fallback(FallbackReason::MarkEnabled, records.len());
-    }
-
     let mut same_len_records = 0usize;
     let mut edit_script_records = 0usize;
     let mut fallback_records = 0usize;
@@ -190,6 +182,18 @@ mod tests {
         let plan = plan_region(&[&ins, &del], PlanOptions::default());
         assert_eq!(plan.lane, FastPathLane::NormalizedEditScript);
         assert_eq!(plan.edit_script_records, 2);
+
+        let marked_plan = plan_region(
+            &[&ins, &del],
+            PlanOptions {
+                mark_del: true,
+                mark_ins: true,
+                mark_snv: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(marked_plan.lane, FastPathLane::NormalizedEditScript);
+        assert_eq!(marked_plan.edit_script_records, 2);
 
         let plan = plan_region(&[&snp, &ins], PlanOptions::default());
         assert_eq!(plan.lane, FastPathLane::MixedSimpleEdits);

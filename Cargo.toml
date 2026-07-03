@@ -21,7 +21,9 @@ python = ["dep:pyo3"]
 smallvec = "1"
 crossbeam-channel = "0.5"
 rayon = "1"
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"], optional = true }
+# abi3-py310: produce a single abi3 wheel that installs on CPython 3.10+
+# (3.10/3.11/3.12/3.13). Lower than this loses API we use; higher caps the floor.
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"], optional = true }
 
 [build-dependencies]
 # none; build.rs drives htslib's own autotools / make

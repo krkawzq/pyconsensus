@@ -8,7 +8,7 @@ A Rust rewrite of `bcftools consensus` for the enformer expression-prediction pi
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Built with PyO3](https://img.shields.io/badge/Built_with-PyO3-orange)](https://pyo3.rs/)
 
 </div>
@@ -46,7 +46,7 @@ pip install dist/pyconsensus-*.whl
 ```
 
 For local development, `maturin develop --release` installs straight into the
-active venv. The wheel is `abi3-py312`, so one build covers CPython 3.12+.
+active venv. The wheel is `abi3-py310` (abi3), so one build covers CPython 3.10+.
 
 ## Usage
 

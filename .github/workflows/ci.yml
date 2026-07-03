@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Pinned htslib commit (1.23.1-64-g9d53dcaa) that build.rs clones on first
+  # build. Surfaced as an env var so a bump is a one-line change here.
+  HTSLIB_REF: 9d53dcaa
+
+jobs:
+  # ── Rust unit tests (no PyO3, no bcftools needed) ─────────────────────────
+  # The core modules (apply / vcf_store / haplotype / iupac / ...) are compiled
+  # as an rlib and tested without the `python` feature, so this job needs no
+  # Python at all.
+  rust-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Install htslib build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool make gcc \
+            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
+
+      - name: cargo test (core, no python feature)
+        run: cargo test --locked
+
+      - name: cargo test (with python feature)
+        run: cargo test --locked --features python
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --features python -- -D warnings
+        continue-on-error: true
+
+  # ── Python import smoke across 3.10–3.15 ──────────────────────────────────
+  # Build the abi3 wheel once, then install it into a matrix of CPython
+  # versions and confirm `import pyconsensus` works and the engine constructs.
+  python-matrix:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Install htslib build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool make gcc \
+            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          # 3.14/3.15 are pre-release; allow-prereleases lets setup-python
+          # pick them from python-build-standalone.
+          allow-prereleases: true
+
+      - name: Build wheel (abi3)
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release -o dist
+
+      - name: Install wheel
+        run: pip install --no-index --find-links dist py-consensus
+
+      - name: Import smoke
+        run: |
+          python -c '
+          import pyconsensus
+          from pyconsensus import ConsensusEngine, Task, ConsensusResult, build_tasks
+          print("version:", pyconsensus.__version__)
+          # Task constructs; engine construction is deferred (needs real inputs)
+          t = Task("chr1", 1, 100, "chr1", "G1")
+          print(repr(t))
+          '
+
+  # ── Byte-exact parity vs a real bcftools binary ───────────────────────────
+  # The `#[ignore]` tests build tiny VCFs + refs on disk, run `bcftools
+  # consensus` with matching flags, and assert byte-identical Rust output.
+  # Needs bcftools / bgzip / tabix on PATH — provided by the htslib apt package.
+  bcftools-parity:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Install bcftools + htslib build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool make gcc \
+            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev \
+            bcftools tabix
+
+      - name: Verify tools on PATH
+        run: |
+          bcftools --version | head -1
+          bgzip --version 2>&1 | head -1
+          tabix --version 2>&1 | head -1
+
+      - name: cargo test --ignored (parity vs bcftools)
+        run: cargo test --locked --features python -- --ignored

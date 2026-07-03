@@ -307,13 +307,7 @@ fn try_apply_same_len_region(
     records: &[&VcfRecord],
     opts: &ApplyOptions,
 ) -> Option<ApplyState> {
-    if records.is_empty()
-        || opts.missing_allele.is_some()
-        || opts.mark_del.is_some()
-        || opts.mark_ins.is_some()
-        || opts.mark_snv.is_some()
-        || opts.mask.is_some()
-    {
+    if records.is_empty() || opts.missing_allele.is_some() || opts.mask.is_some() {
         return None;
     }
 
@@ -410,6 +404,16 @@ fn try_apply_same_len_region(
             &patch.alt,
             to_upper,
         );
+        if let Some(mark) = opts.mark_snv {
+            mark_snv_bytes(
+                &ref_seq[patch.idx..patch.idx + patch.rlen],
+                0,
+                &mut state.buf[patch.idx..patch.idx + patch.rlen],
+                0,
+                patch.rlen as i64,
+                mark,
+            );
+        }
         state.prev_base = last_base;
         state.prev_base_pos = patch.pos + patch.rlen as i64 - 1;
         state.prev_is_insert = false;
@@ -438,13 +442,7 @@ fn try_apply_edit_script_region(
     records: &[&VcfRecord],
     opts: &ApplyOptions,
 ) -> Option<(ApplyState, FastPathLane)> {
-    if records.is_empty()
-        || opts.missing_allele.is_some()
-        || opts.mark_del.is_some()
-        || opts.mark_ins.is_some()
-        || opts.mark_snv.is_some()
-        || opts.mask.is_some()
-    {
+    if records.is_empty() || opts.missing_allele.is_some() || opts.mask.is_some() {
         return None;
     }
 
@@ -474,12 +472,19 @@ fn try_apply_edit_script_region(
             if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
                 return None;
             }
+            let to_upper = ref_seq[idx].is_ascii_uppercase();
+            let mut alt = SmallVec::from_slice(&rec.alleles[0]);
+            apply_case_to_alt(&mut alt, to_upper);
+            if let Some(mark) = opts.mark_snv {
+                let alt_len = alt.len() as i64;
+                mark_snv_bytes(&rec.alleles[0], 0, &mut alt, 0, alt_len, mark);
+            }
             patches.push(EditScriptPatch {
                 idx,
                 pos: rec.pos,
                 rlen,
                 len_diff: 0,
-                alt: SmallVec::from_slice(&rec.alleles[0]),
+                alt,
                 count_applied: false,
             });
             saw_same_len = true;
@@ -522,7 +527,7 @@ fn try_apply_edit_script_region(
             return None;
         }
 
-        let alt = match alt_override {
+        let mut alt = match alt_override {
             Some(alt) if alt.len() == rlen && op.is_same_len_fastpath() => alt,
             Some(_) => return None,
             None => SmallVec::from_slice(&rec.alleles[ialt]),
@@ -537,12 +542,31 @@ fn try_apply_edit_script_region(
             return None;
         }
 
-        let len_diff = alt.len() as i64 - rlen as i64;
-        if len_diff == 0 {
+        let original_len_diff = alt.len() as i64 - rlen as i64;
+        let mut len_diff = original_len_diff;
+        if original_len_diff == 0 {
             saw_same_len = true;
         } else {
             saw_len_change = true;
         }
+
+        if original_len_diff < 0 && opts.mark_del.is_some() {
+            alt = mark_del_bytes(ref_allele, 0, rlen as i64, Some(&alt), opts.mark_del);
+            len_diff = 0;
+        }
+        let to_upper = ref_seq[idx].is_ascii_uppercase();
+        apply_case_to_alt(&mut alt, to_upper);
+        if let Some(mark) = opts.mark_ins {
+            if len_diff > 0 {
+                let alt_len = alt.len() as i64;
+                mark_ins_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
+            }
+        }
+        if let Some(mark) = opts.mark_snv {
+            let alt_len = alt.len() as i64;
+            mark_snv_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
+        }
+
         total_delta += len_diff;
         patches.push(EditScriptPatch {
             idx,
@@ -588,7 +612,7 @@ fn try_apply_edit_script_region(
         let last_base = ref_seq[patch.idx + patch.rlen - 1];
         let to_upper = first_base.is_ascii_uppercase();
         last_case = if to_upper { TO_UPPER } else { TO_LOWER };
-        extend_alt_with_case(&mut out, &patch.alt, to_upper);
+        out.extend_from_slice(&patch.alt);
 
         cursor = patch.idx + patch.rlen;
         prev_base = last_base;
@@ -1111,9 +1135,6 @@ fn try_apply_same_len_allele(
     state: &mut ApplyState,
     opts: &ApplyOptions,
 ) -> bool {
-    if opts.mark_del.is_some() || opts.mark_ins.is_some() || opts.mark_snv.is_some() {
-        return false;
-    }
     if rec.rlen <= 0 {
         return false;
     }
@@ -1171,6 +1192,16 @@ fn try_apply_same_len_allele(
     let to_upper = first_base.is_ascii_uppercase();
     state.case = if to_upper { TO_UPPER } else { TO_LOWER };
     copy_alt_with_case(&mut state.buf[idx..idx + rlen], alt_allele, to_upper);
+    if let Some(mark) = opts.mark_snv {
+        mark_snv_bytes(
+            ref_allele,
+            0,
+            &mut state.buf[idx..idx + rlen],
+            0,
+            rlen as i64,
+            mark,
+        );
+    }
 
     state.prev_base = last_base;
     state.prev_base_pos = pos + rec.rlen as i64 - 1;
@@ -1226,13 +1257,13 @@ fn copy_alt_with_case(dst: &mut [u8], alt: &[u8], to_upper: bool) {
     }
 }
 
-fn extend_alt_with_case(out: &mut Vec<u8>, alt: &[u8], to_upper: bool) {
+fn apply_case_to_alt(alt: &mut [u8], to_upper: bool) {
     if alt.len() == 1 {
-        out.push(if to_upper {
+        alt[0] = if to_upper {
             alt[0].to_ascii_uppercase()
         } else {
             alt[0].to_ascii_lowercase()
-        });
+        };
         return;
     }
     let needs_conversion = if to_upper {
@@ -1241,13 +1272,16 @@ fn extend_alt_with_case(out: &mut Vec<u8>, alt: &[u8], to_upper: bool) {
         needs_lowercase_conversion(alt)
     };
     if !needs_conversion {
-        out.extend_from_slice(alt);
         return;
     }
     if to_upper {
-        out.extend(alt.iter().map(u8::to_ascii_uppercase));
+        for b in alt {
+            *b = b.to_ascii_uppercase();
+        }
     } else {
-        out.extend(alt.iter().map(u8::to_ascii_lowercase));
+        for b in alt {
+            *b = b.to_ascii_lowercase();
+        }
     }
 }
 
@@ -1549,6 +1583,25 @@ mod tests {
     }
 
     #[test]
+    fn same_len_fastpath_handles_mark_snv() {
+        let vcf = write_vcf("same_len_mark_snv", "chr1\t3\t.\tGT\tCA\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mark_snv: Some(b'X'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACXXACGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
     fn stats_entry_uses_empty_region_lane() {
         let opts = ApplyOptions::default();
         let mut stats = RuntimeStats::default();
@@ -1622,6 +1675,44 @@ mod tests {
         assert_eq!(state.buf, b"NCAANNAN");
         assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
         assert_eq!(stats.edit_script_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_handles_mark_ins() {
+        let vcf = write_vcf("edit_script_mark_ins", "chr1\t2\t.\tC\tCAA\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mark_ins: Some(b'#'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AC##GTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_handles_mark_del() {
+        let vcf = write_vcf("edit_script_mark_del", "chr1\t5\t.\tACG\tA\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mark_del: Some(b'#'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACGTA##T");
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
         assert_eq!(stats.fallback_records, 0);
     }
 

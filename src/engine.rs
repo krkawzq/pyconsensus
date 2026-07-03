@@ -8,7 +8,7 @@
 //!
 //! This module is PyO3-free; `py.rs` wraps it under the `python` feature.
 
-use crate::apply::{apply_region_planned, ApplyOptions};
+use crate::apply::{apply_region_planned, ApplyOptions, TO_LOWER, TO_UPPER};
 use crate::chain::Chain;
 use crate::compiled::RecordFlags;
 use crate::haplotype::{HaplotypeSpec, SampleMode};
@@ -72,6 +72,7 @@ struct BatchTask {
 struct SameLenBatchPatch<'a> {
     idx: usize,
     rlen: usize,
+    ref_allele: &'a [u8],
     alt: &'a [u8],
     gt_bits: &'a crate::vcf_store::BiallelicPhasedGtBits,
 }
@@ -444,9 +445,6 @@ impl ConsensusEngine {
             || self.opts.mask.is_some()
             || self.opts.absent.is_some()
             || self.opts.missing.is_some()
-            || self.opts.mark_del.is_some()
-            || self.opts.mark_ins.is_some()
-            || self.opts.mark_snv.is_some()
         {
             return None;
         }
@@ -523,6 +521,7 @@ impl ConsensusEngine {
             patches.push(SameLenBatchPatch {
                 idx,
                 rlen,
+                ref_allele: &rec.alleles[0],
                 alt: &rec.alleles[1],
                 gt_bits,
             });
@@ -547,6 +546,9 @@ impl ConsensusEngine {
                 let buf = buffers[task_i].as_mut().expect("batch buffer present");
                 let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
                 copy_alt_with_case(dst, patch.alt, to_upper);
+                if let Some(mark) = self.opts.mark_snv {
+                    mark_snv_in_place(patch.ref_allele, dst, mark);
+                }
             }
         }
 
@@ -986,6 +988,29 @@ fn copy_alt_with_case(dst: &mut [u8], alt: &[u8], to_upper: bool) {
     }
 }
 
+fn mark_snv_in_place(ref_allele: &[u8], dst: &mut [u8], mark: u8) {
+    let n = ref_allele.len().min(dst.len());
+    if mark == TO_UPPER as u8 {
+        for i in 0..n {
+            if !ref_allele[i].eq_ignore_ascii_case(&dst[i]) {
+                dst[i] = dst[i].to_ascii_uppercase();
+            }
+        }
+    } else if mark == TO_LOWER as u8 {
+        for i in 0..n {
+            if !ref_allele[i].eq_ignore_ascii_case(&dst[i]) {
+                dst[i] = dst[i].to_ascii_lowercase();
+            }
+        }
+    } else {
+        for i in 0..n {
+            if !ref_allele[i].eq_ignore_ascii_case(&dst[i]) {
+                dst[i] = mark;
+            }
+        }
+    }
+}
+
 fn error_result(task: &ConsensusTask, err: String) -> ConsensusResult {
     ConsensusResult {
         gene_id: task.gene_id.clone(),
@@ -1396,5 +1421,87 @@ mod tests {
         assert_eq!(results[1].seq, b"AGGTACGT");
         assert_eq!(results[2].seq, b"AGGTACGT");
         assert_eq!(results[3].seq, b"ACTTACGT");
+    }
+
+    #[test]
+    fn biallelic_phased_batch_lane_handles_mark_snv() {
+        let (ref_fa, vcf) = setup_phased_batch("phased_batch_mark_snv");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(
+            ref_fa,
+            vcf_map,
+            EngineOptions {
+                mark_snv: Some(b'X'),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H1".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2".into()),
+            },
+        ];
+
+        let groups = group_tasks(&tasks);
+        let vcf = engine.vcfs.get("chr1").unwrap();
+        let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
+        let (records, plan) = vcf.plan_query(
+            "chr1",
+            0,
+            7,
+            engine.opts.regions_overlap,
+            engine.plan_options(),
+        );
+        let batch = engine
+            .try_run_biallelic_phased_batch(&tasks, &groups[0], vcf, &ref_seq, 0, &records, &plan)
+            .expect("batch lane should accept same-len marked SNPs");
+        let mut by_idx = vec![Vec::new(); batch.len()];
+        for (idx, result) in batch {
+            by_idx[idx] = result.seq;
+        }
+        assert_eq!(by_idx[0], b"ACXTACGT");
+        assert_eq!(by_idx[1], b"AXGTACGT");
+        assert_eq!(by_idx[2], b"AXGTACGT");
+        assert_eq!(by_idx[3], b"ACXTACGT");
+
+        let results = engine.consensus_many(tasks, 2);
+        assert_eq!(results[0].seq, b"ACXTACGT");
+        assert_eq!(results[1].seq, b"AXGTACGT");
+        assert_eq!(results[2].seq, b"AXGTACGT");
+        assert_eq!(results[3].seq, b"ACXTACGT");
     }
 }
