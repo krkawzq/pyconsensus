@@ -1,0 +1,32 @@
+[package]
+name = "consensus-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust rewrite of bcftools consensus for online enformer expression data"
+license = "MIT"
+
+[lib]
+# cdylib -> Python extension module (import name `pyconsensus.engine`)
+# rlib   -> enables `cargo test` / bench of core modules without PyO3
+name = "engine"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable PyO3 Python bindings. Core modules (htslib_ffi / vcf_store / apply / ...)
+# do NOT depend on this feature and can be unit-tested without it.
+python = ["dep:pyo3"]
+
+[dependencies]
+smallvec = "1"
+crossbeam-channel = "0.5"
+rayon = "1"
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py312"], optional = true }
+
+[build-dependencies]
+# none; build.rs drives htslib's own autotools / make
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

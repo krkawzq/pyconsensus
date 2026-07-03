@@ -1,0 +1,161 @@
+"""Public Python API for the pyconsensus engine.
+
+A thin pure-Python layer over the private Rust extension module
+`pyconsensus._engine` (which exposes `Task`, `ConsensusResult`,
+`_ConsensusEngine`, `_ConsensusIter`). Python-side logic — input expansion,
+validation, future pre/post-processing — lives here so it can evolve without
+recompiling Rust.
+
+Layering:
+  * `Task` / `ConsensusResult` — Rust dataclass-style objects (re-exported).
+  * `build_tasks(...)`          — expand regions × samples × haplotypes into a
+                                  flat `list[Task]` (eager, Python-side).
+  * `ConsensusEngine`           — public subclass of `_ConsensusEngine`; adds
+                                  `consensus_regions` on top of the inherited
+                                  `consensus_many` / `consensus_iter`.
+
+The engine holds only preprocessed material (ref + VCFs); compute resources
+(thread pool, thread count) are passed per `consensus_*` call. The Rust side
+never expands a cartesian product — it receives a flat task list verbatim.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+
+from ._engine import (
+    ConsensusResult,
+    Task,
+    _ConsensusEngine,
+    _ConsensusIter,
+    __version__,
+)
+
+__all__ = [
+    "ConsensusEngine",
+    "ConsensusResult",
+    "Task",
+    "build_tasks",
+    "__version__",
+]
+
+
+def build_tasks(
+    regions: Sequence[Task],
+    samples: Sequence[str] | None = None,
+    haplotypes: Sequence[str] | None = None,
+) -> list[Task]:
+    """Expand ``regions × samples × haplotypes`` into a flat task list.
+
+    Each entry of `regions` is a `Task` whose `sample` / `haplotype` are
+    ignored (treated as a region template: chr/start/end/vcf_key/gene_id). A
+    `None` (or empty) dimension collapses — it yields one task with that field
+    set to `None` rather than zero tasks:
+
+    * ``build_tasks(regions)``                      -> one task/region, no sample/hap
+    * ``build_tasks(regions, samples)``             -> one task/(region,sample), no hap
+    * ``build_tasks(regions, samples, haplotypes)`` -> full product
+
+    Order is region-major (region, then sample, then haplotype): all haplotypes
+    of a sample for a gene are contiguous, then the next sample, then the next
+    gene — matching the layout ``make_consensus_enformer_new.py`` wrote.
+    """
+    samp_dim: list[str | None] = list(samples) if samples else [None]
+    hap_dim: list[str | None] = list(haplotypes) if haplotypes else [None]
+
+    tasks: list[Task] = []
+    for reg in regions:
+        for sample in samp_dim:
+            for hap in hap_dim:
+                tasks.append(
+                    Task(
+                        reg.chr,
+                        reg.start,
+                        reg.end,
+                        reg.vcf_key,
+                        reg.gene_id,
+                        sample,
+                        hap,
+                    )
+                )
+    return tasks
+
+
+class ConsensusEngine(_ConsensusEngine):
+    """Public engine, subclassing the private Rust `_ConsensusEngine`.
+
+    `consensus_many` / `consensus_iter` are inherited verbatim from the Rust
+    parent — no forwarding boilerplate. This subclass only adds the
+    `consensus_regions` convenience method, which expands regions × samples ×
+    haplotypes in Python and feeds the flat task list to the inherited
+    `consensus_iter`.
+
+    Both paths feed the Rust engine a flat task list verbatim; the engine does
+    no product expansion of its own. `consensus_iter` / `consensus_regions`
+    return the Rust `_ConsensusIter` directly (no Python wrapper) — it already
+    implements `__iter__` / `__next__` and releases the GIL while blocking.
+    """
+
+    def __init__(
+        self,
+        ref_path: str,
+        vcfs: Mapping[str, str],
+        iupac_codes: bool = False,
+        missing: str | None = None,
+        absent: str | None = None,
+        mark_del: str | None = None,
+        mark_ins: str | None = None,
+        mark_snv: str | None = None,
+        mask: str | None = None,
+        mask_with: str = "N",
+        chain: bool = False,
+        regions_overlap: int = 1,
+    ) -> None:
+        super().__init__(
+            ref_path=ref_path,
+            vcfs=dict(vcfs),
+            iupac_codes=iupac_codes,
+            missing=missing,
+            absent=absent,
+            mark_del=mark_del,
+            mark_ins=mark_ins,
+            mark_snv=mark_snv,
+            mask=mask,
+            mask_with=mask_with,
+            chain=chain,
+            regions_overlap=regions_overlap,
+        )
+
+    # -- convenience: cartesian product -------------------------------------
+
+    def consensus_regions(
+        self,
+        regions: Sequence[Task],
+        samples: Sequence[str] | None = None,
+        haplotypes: Sequence[str] | None = None,
+        *,
+        threads: int = 1,
+        prefetch_steps: int = 16,
+        warmup: bool = False,
+        ordered: bool = False,
+    ) -> _ConsensusIter:
+        """Build ``regions × samples × haplotypes`` and return a lazy iterator.
+
+        The cartesian product is materialised eagerly in Python (via
+        :func:`build_tasks`) into a flat ``list[Task]``; that list is then handed
+        to the Rust engine's lazy iterator verbatim. So "lazy" here means the
+        *results* are produced on demand by Rust worker threads — the task list
+        itself is fully built up front.
+
+        Pass ``ordered=True`` to get results back in input (region-major) order;
+        the default ``ordered=False`` yields in completion order, each result
+        carrying its ``idx`` for re-pairing.
+        """
+        tasks = build_tasks(regions, samples, haplotypes)
+        return self.consensus_iter(
+            tasks,
+            prefetch_steps=prefetch_steps,
+            warmup=warmup,
+            ordered=ordered,
+            threads=threads,
+        )

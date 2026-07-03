@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyconsensus"
+version = "0.1.0"
+description = "Rust rewrite of bcftools consensus for online enformer expression data"
+license = "MIT"
+requires-python = ">=3.12"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+features = ["python"]
+module-name = "pyconsensus._engine"
+python-source = "."
+include = [
+    "pyconsensus/__init__.pyi",
+    "pyconsensus/_engine.pyi",
+    "pyconsensus/engine.py",
+    "pyconsensus/py.typed",
+]
