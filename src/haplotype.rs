@@ -7,7 +7,7 @@
 use crate::iupac::{
     iupac_set_all_alleles, iupac_set_allele, iupac_set_allele_mask, IupacAlleleBuf,
 };
-use crate::vcf_store::{GtAllele, VcfRecord};
+use crate::vcf_store::{CompactGt, GtAllele, VcfRecord};
 use smallvec::SmallVec;
 
 // PICK_* flags (consensus.c:51-55)
@@ -28,47 +28,43 @@ impl HaplotypeSpec {
     /// Parse a cli `-H` string. Returns None on unrecognised input.
     /// Mirrors consensus.c:1310-1328.
     pub fn parse(s: &str) -> Option<Self> {
-        let upper = s.to_ascii_uppercase();
         let mut spec = HaplotypeSpec::default();
-        match upper.as_str() {
-            "R" => spec.pick |= PICK_REF,
-            "A" => spec.pick |= PICK_ALT,
-            "L" => spec.pick |= PICK_LONG | PICK_REF,
-            "S" => spec.pick |= PICK_SHORT | PICK_REF,
-            "LR" => spec.pick |= PICK_LONG | PICK_REF,
-            "LA" => spec.pick |= PICK_LONG | PICK_ALT,
-            "SR" => spec.pick |= PICK_SHORT | PICK_REF,
-            "SA" => spec.pick |= PICK_SHORT | PICK_ALT,
-            "I" => spec.pick |= PICK_IUPAC,
-            "1PIU" => {
-                spec.pick |= PICK_IUPAC;
-                spec.haplotype = Some(1);
+        if s.eq_ignore_ascii_case("R") {
+            spec.pick |= PICK_REF;
+        } else if s.eq_ignore_ascii_case("A") {
+            spec.pick |= PICK_ALT;
+        } else if s.eq_ignore_ascii_case("L") || s.eq_ignore_ascii_case("LR") {
+            spec.pick |= PICK_LONG | PICK_REF;
+        } else if s.eq_ignore_ascii_case("S") || s.eq_ignore_ascii_case("SR") {
+            spec.pick |= PICK_SHORT | PICK_REF;
+        } else if s.eq_ignore_ascii_case("LA") {
+            spec.pick |= PICK_LONG | PICK_ALT;
+        } else if s.eq_ignore_ascii_case("SA") {
+            spec.pick |= PICK_SHORT | PICK_ALT;
+        } else if s.eq_ignore_ascii_case("I") {
+            spec.pick |= PICK_IUPAC;
+        } else {
+            let bytes = s.as_bytes();
+            let mut i = 0usize;
+            let mut hap = 0u32;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                hap = hap.checked_mul(10)?.checked_add((bytes[i] - b'0') as u32)?;
+                i += 1;
             }
-            "2PIU" => {
-                spec.pick |= PICK_IUPAC;
-                spec.haplotype = Some(2);
+            if i == 0 || hap == 0 {
+                return None;
             }
-            _ => {
-                // "<N>" or "<N>pIu"
-                let (num_part, rest) = match upper.find(|c: char| !c.is_ascii_digit()) {
-                    Some(i) => (&upper[..i], &upper[i..]),
-                    None => (upper.as_str(), ""),
-                };
-                if num_part.is_empty() {
-                    return None;
-                }
-                let n: u32 = num_part.parse().ok()?;
-                if n == 0 {
-                    return None;
-                }
-                spec.haplotype = Some(n);
-                if rest.is_empty() {
-                    // plain number -> use_hap, no IUPAC
-                } else if rest == "PIU" {
-                    spec.pick |= PICK_IUPAC;
-                } else {
-                    return None;
-                }
+            spec.haplotype = Some(hap);
+            if i == bytes.len() {
+                // plain number -> use_hap, no IUPAC
+            } else if bytes.len() - i == 3
+                && bytes[i].eq_ignore_ascii_case(&b'p')
+                && bytes[i + 1].eq_ignore_ascii_case(&b'i')
+                && bytes[i + 2].eq_ignore_ascii_case(&b'u')
+            {
+                spec.pick |= PICK_IUPAC;
+            } else {
+                return None;
             }
         }
         Some(spec)
@@ -76,18 +72,18 @@ impl HaplotypeSpec {
 }
 
 /// How alleles are chosen for a record, mirroring init_data's classification.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum SampleMode {
+    #[default]
     ApplyAllAlt,
-    IupacAllSamples { samples: Vec<i32> },
-    SingleSample { idx: i32, spec: HaplotypeSpec },
+    IupacAllSamples {
+        samples: Vec<i32>,
+    },
+    SingleSample {
+        idx: i32,
+        spec: HaplotypeSpec,
+    },
     IupacFromRefAlt,
-}
-
-impl Default for SampleMode {
-    fn default() -> Self {
-        SampleMode::ApplyAllAlt
-    }
 }
 
 /// Result of selecting an allele for a record.
@@ -129,6 +125,9 @@ pub fn select_allele(
         },
         SampleMode::IupacAllSamples { samples } => {
             // consensus.c:603-619: accumulate GT alleles across samples, IUPAC-mix.
+            if let Some(compact) = &rec.gt_compact {
+                return select_iupac_all_samples_compact(rec, compact, samples, missing_allele);
+            }
             if rec.gt.is_empty() {
                 return AlleleSelection {
                     ialt: None,
@@ -225,6 +224,9 @@ fn select_single_sample(
     if let Some(selection) = select_biallelic_hap_fast(rec, idx, spec, missing_allele) {
         return selection;
     }
+    if let Some(compact) = &rec.gt_compact {
+        return select_single_sample_compact(rec, compact, idx, spec, missing_allele);
+    }
 
     if rec.gt.is_empty() {
         return AlleleSelection {
@@ -250,9 +252,7 @@ fn select_single_sample(
         PickOne,
     }
     let action = if spec.pick & PICK_IUPAC != 0 {
-        if spec.haplotype.is_none() {
-            Action::UseIupac
-        } else if !is_phased(gt, 0) && !is_phased_last(gt) {
+        if spec.haplotype.is_none() || (!is_phased(gt, 0) && !is_phased_last(gt)) {
             Action::UseIupac
         } else {
             Action::UseHap
@@ -305,7 +305,7 @@ fn select_single_sample(
                 };
             }
             AlleleSelection {
-                ialt: a.allele.map(|i| i as i32),
+                ialt: a.allele,
                 alt_override: None,
             }
         }
@@ -381,7 +381,7 @@ fn select_single_sample(
             let mut first: Option<i32> = None;
             for a in gt {
                 let cur = match a.allele {
-                    Some(v) => v as i32,
+                    Some(v) => v,
                     None => {
                         if missing_allele.is_none() {
                             return AlleleSelection {
@@ -416,7 +416,7 @@ fn select_single_sample(
             let mut chosen: i32 = 0;
             for a in gt {
                 let jalt = match a.allele {
-                    Some(x) => x as i32,
+                    Some(x) => x,
                     None => continue,
                 };
                 if rec.alleles.len() <= jalt as usize {
@@ -428,30 +428,22 @@ fn select_single_sample(
                     rec.alleles[jalt as usize].len() as i64
                 };
                 if spec.pick & (PICK_LONG | PICK_SHORT) != 0 {
-                    if prev_len == 0 {
-                        chosen = jalt;
-                        prev_len = len;
-                    } else if len == prev_len {
-                        if spec.pick & PICK_REF != 0 && jalt == 0 {
-                            chosen = jalt;
-                            prev_len = len;
-                        } else if spec.pick & PICK_ALT != 0 && chosen == 0 {
-                            chosen = jalt;
-                            prev_len = len;
-                        }
-                    } else if spec.pick & PICK_LONG != 0 && len > prev_len {
-                        chosen = jalt;
-                        prev_len = len;
-                    } else if spec.pick & PICK_SHORT != 0 && len < prev_len {
+                    // Mirrors consensus.c:679-721: every matching branch sets the
+                    // same (chosen, prev_len), so the conditions fold into one.
+                    if prev_len == 0
+                        || (len == prev_len
+                            && ((spec.pick & PICK_REF != 0 && jalt == 0)
+                                || (spec.pick & PICK_ALT != 0 && chosen == 0)))
+                        || (spec.pick & PICK_LONG != 0 && len > prev_len)
+                        || (spec.pick & PICK_SHORT != 0 && len < prev_len)
+                    {
                         chosen = jalt;
                         prev_len = len;
                     }
-                } else {
-                    if spec.pick & PICK_REF != 0 && jalt == 0 {
-                        chosen = jalt;
-                    } else if spec.pick & PICK_ALT != 0 && chosen == 0 {
-                        chosen = jalt;
-                    }
+                } else if (spec.pick & PICK_REF != 0 && jalt == 0)
+                    || (spec.pick & PICK_ALT != 0 && chosen == 0)
+                {
+                    chosen = jalt;
                 }
             }
             AlleleSelection {
@@ -459,6 +451,270 @@ fn select_single_sample(
                 alt_override: None,
             }
         }
+    }
+}
+
+fn select_iupac_all_samples_compact(
+    rec: &VcfRecord,
+    compact: &CompactGt,
+    samples: &[i32],
+    missing_allele: Option<u8>,
+) -> AlleleSelection {
+    let n_allele = rec.alleles.len();
+    if n_allele <= 64 {
+        let mut selected_mask = 0u64;
+        for &s in samples {
+            if s < 0 {
+                continue;
+            }
+            let Some(gt) = compact.sample(s as usize) else {
+                continue;
+            };
+            selected_mask |= compact_selected_mask(gt, n_allele);
+        }
+        if selected_mask == 0 {
+            return missing_or_skip(missing_allele);
+        }
+        let alleles = allele_slices(rec);
+        let (ialt, out) = iupac_set_allele_mask(&alleles, selected_mask);
+        return AlleleSelection {
+            ialt: ialt.map(|i| i as i32),
+            alt_override: if out.is_empty() { None } else { Some(out) },
+        };
+    }
+
+    let mut selected: SmallVec<[bool; 8]> = SmallVec::new();
+    selected.resize(n_allele, false);
+    let mut is_set = false;
+    for &s in samples {
+        if s < 0 {
+            continue;
+        }
+        let Some(gt) = compact.sample(s as usize) else {
+            continue;
+        };
+        for &code in gt {
+            if let Some(idx) = CompactGt::allele(code) {
+                let idx = idx as usize;
+                if idx < n_allele {
+                    selected[idx] = true;
+                    is_set = true;
+                }
+            }
+        }
+    }
+    if !is_set {
+        return missing_or_skip(missing_allele);
+    }
+    let alleles = allele_slices(rec);
+    let (ialt, out) = iupac_set_allele(&alleles, &selected);
+    AlleleSelection {
+        ialt: ialt.map(|i| i as i32),
+        alt_override: if out.is_empty() { None } else { Some(out) },
+    }
+}
+
+fn select_single_sample_compact(
+    rec: &VcfRecord,
+    compact: &CompactGt,
+    idx: i32,
+    spec: &HaplotypeSpec,
+    missing_allele: Option<u8>,
+) -> AlleleSelection {
+    if idx < 0 {
+        return skip_selection();
+    }
+    let Some(gt) = compact.sample(idx as usize) else {
+        return skip_selection();
+    };
+    let ploidy = gt.len();
+
+    enum Action {
+        UseHap,
+        UseIupac,
+        PickOne,
+    }
+    let action = if spec.pick & PICK_IUPAC != 0 {
+        if spec.haplotype.is_none() || (!compact_is_phased(gt, 0) && !compact_is_phased_last(gt)) {
+            Action::UseIupac
+        } else {
+            Action::UseHap
+        }
+    } else if spec.haplotype.is_none() {
+        Action::PickOne
+    } else {
+        Action::UseHap
+    };
+
+    match action {
+        Action::UseHap => {
+            let hap = spec.haplotype.unwrap_or(1) as usize;
+            if hap > ploidy {
+                let missing_end = gt
+                    .last()
+                    .map(|&code| CompactGt::allele(code).is_none())
+                    .unwrap_or(true)
+                    || gt
+                        .first()
+                        .map(|&code| CompactGt::allele(code).is_none())
+                        .unwrap_or(true);
+                if missing_end {
+                    return missing_or_skip(missing_allele);
+                }
+                return skip_selection();
+            }
+            match CompactGt::allele(gt[hap - 1]) {
+                Some(ialt) => AlleleSelection {
+                    ialt: Some(ialt),
+                    alt_override: None,
+                },
+                None => missing_or_skip(missing_allele),
+            }
+        }
+        Action::UseIupac => {
+            let n_allele = rec.alleles.len();
+            if n_allele <= 64 {
+                let selected_mask = compact_selected_mask(gt, n_allele);
+                if selected_mask == 0 {
+                    return missing_or_skip(missing_allele);
+                }
+                let alleles = allele_slices(rec);
+                let (ialt, out) = iupac_set_allele_mask(&alleles, selected_mask);
+                return AlleleSelection {
+                    ialt: ialt.map(|i| i as i32),
+                    alt_override: if out.is_empty() { None } else { Some(out) },
+                };
+            }
+
+            let mut selected: SmallVec<[bool; 8]> = SmallVec::new();
+            selected.resize(n_allele, false);
+            let mut is_set = false;
+            for &code in gt {
+                if let Some(idx) = CompactGt::allele(code) {
+                    let idx = idx as usize;
+                    if idx < n_allele {
+                        selected[idx] = true;
+                        is_set = true;
+                    }
+                }
+            }
+            if !is_set {
+                return missing_or_skip(missing_allele);
+            }
+            let alleles = allele_slices(rec);
+            let (ialt, out) = iupac_set_allele(&alleles, &selected);
+            AlleleSelection {
+                ialt: ialt.map(|i| i as i32),
+                alt_override: if out.is_empty() { None } else { Some(out) },
+            }
+        }
+        Action::PickOne => {
+            let mut ialt: i32 = 0;
+            let mut is_hom = true;
+            let mut first: Option<i32> = None;
+            for &code in gt {
+                let cur = match CompactGt::allele(code) {
+                    Some(v) => v,
+                    None => return missing_or_skip(missing_allele),
+                };
+                if let Some(first) = first {
+                    if cur != first {
+                        is_hom = false;
+                        break;
+                    }
+                } else {
+                    first = Some(cur);
+                }
+                ialt = cur;
+            }
+            if is_hom {
+                return AlleleSelection {
+                    ialt: Some(ialt),
+                    alt_override: None,
+                };
+            }
+
+            let mut prev_len: i64 = 0;
+            let mut chosen: i32 = 0;
+            for &code in gt {
+                let Some(jalt) = CompactGt::allele(code) else {
+                    continue;
+                };
+                if rec.alleles.len() <= jalt as usize {
+                    continue;
+                }
+                let len = if jalt == 0 {
+                    rec.rlen as i64
+                } else {
+                    rec.alleles[jalt as usize].len() as i64
+                };
+                if spec.pick & (PICK_LONG | PICK_SHORT) != 0 {
+                    if prev_len == 0
+                        || (len == prev_len
+                            && ((spec.pick & PICK_REF != 0 && jalt == 0)
+                                || (spec.pick & PICK_ALT != 0 && chosen == 0)))
+                        || (spec.pick & PICK_LONG != 0 && len > prev_len)
+                        || (spec.pick & PICK_SHORT != 0 && len < prev_len)
+                    {
+                        chosen = jalt;
+                        prev_len = len;
+                    }
+                } else if (spec.pick & PICK_REF != 0 && jalt == 0)
+                    || (spec.pick & PICK_ALT != 0 && chosen == 0)
+                {
+                    chosen = jalt;
+                }
+            }
+            AlleleSelection {
+                ialt: Some(chosen),
+                alt_override: None,
+            }
+        }
+    }
+}
+
+fn compact_selected_mask(gt: &[u16], n_allele: usize) -> u64 {
+    let mut selected_mask = 0u64;
+    for &code in gt {
+        if let Some(idx) = CompactGt::allele(code) {
+            let idx = idx as usize;
+            if idx < n_allele {
+                selected_mask |= 1u64 << idx;
+            }
+        }
+    }
+    selected_mask
+}
+
+#[inline]
+fn compact_is_phased(gt: &[u16], i: usize) -> bool {
+    gt.get(i)
+        .map(|&code| CompactGt::phased(code))
+        .unwrap_or(false)
+}
+
+#[inline]
+fn compact_is_phased_last(gt: &[u16]) -> bool {
+    gt.last()
+        .map(|&code| CompactGt::phased(code))
+        .unwrap_or(false)
+}
+
+fn missing_or_skip(missing_allele: Option<u8>) -> AlleleSelection {
+    if missing_allele.is_some() {
+        AlleleSelection {
+            ialt: Some(-1),
+            alt_override: None,
+        }
+    } else {
+        skip_selection()
+    }
+}
+
+fn skip_selection() -> AlleleSelection {
+    AlleleSelection {
+        ialt: None,
+        alt_override: None,
     }
 }
 
@@ -541,6 +797,7 @@ mod tests {
             rid: 0,
             alleles: vec![SmallVec::from_slice(b"A"), SmallVec::from_slice(b"G")],
             gt: vec![],
+            gt_compact: None,
             gt_bits: None,
             var_type: 1,
             compiled: crate::compiled::CompiledRecord::from_alleles(
@@ -580,6 +837,7 @@ mod tests {
             raw: 0,
         });
         let gt = vec![s0, s1];
+        let gt_compact = crate::vcf_store::CompactGt::from_gt(2, &gt);
         let gt_bits = crate::vcf_store::BiallelicPhasedGtBits::from_gt(2, 2, &gt);
         let rec = VcfRecord {
             pos: 0,
@@ -587,6 +845,7 @@ mod tests {
             rid: 0,
             alleles: vec![SmallVec::from_slice(b"A"), SmallVec::from_slice(b"G")],
             gt,
+            gt_compact,
             gt_bits,
             var_type: 1,
             compiled: crate::compiled::CompiledRecord::from_alleles(
@@ -606,5 +865,57 @@ mod tests {
 
         assert_eq!(select_allele(&rec, &hap1, None).ialt, Some(0));
         assert_eq!(select_allele(&rec, &hap2, None).ialt, Some(1));
+    }
+
+    #[test]
+    fn single_sample_haplotype_uses_compact_gt_without_raw_matrix() {
+        use smallvec::SmallVec;
+
+        let mut s0: SmallVec<[GtAllele; 2]> = SmallVec::new();
+        s0.push(GtAllele {
+            allele: Some(0),
+            phased: true,
+            raw: 0,
+        });
+        s0.push(GtAllele {
+            allele: Some(2),
+            phased: true,
+            raw: 0,
+        });
+        let gt = vec![s0];
+        let gt_compact = crate::vcf_store::CompactGt::from_gt(1, &gt);
+        let rec = VcfRecord {
+            pos: 0,
+            rlen: 1,
+            rid: 0,
+            alleles: vec![
+                SmallVec::from_slice(b"A"),
+                SmallVec::from_slice(b"C"),
+                SmallVec::from_slice(b"G"),
+            ],
+            gt: Vec::new(),
+            gt_compact,
+            gt_bits: None,
+            var_type: 1,
+            compiled: crate::compiled::CompiledRecord::from_alleles(
+                1,
+                &[
+                    SmallVec::from_slice(b"A"),
+                    SmallVec::from_slice(b"C"),
+                    SmallVec::from_slice(b"G"),
+                ],
+            ),
+        };
+
+        let hap2 = SampleMode::SingleSample {
+            idx: 0,
+            spec: HaplotypeSpec::parse("2").unwrap(),
+        };
+        assert_eq!(select_allele(&rec, &hap2, None).ialt, Some(2));
+
+        let all_sample_iupac = SampleMode::IupacAllSamples { samples: vec![0] };
+        let selected = select_allele(&rec, &all_sample_iupac, None);
+        assert!(selected.ialt.is_some());
+        assert!(selected.alt_override.is_some());
     }
 }

@@ -97,6 +97,11 @@ impl RecordFlags {
     pub const ALL_ALT_FASTPATH_ELIGIBLE: u16 = 1 << 6;
 
     #[inline]
+    pub fn from_bits(bits: u16) -> Self {
+        RecordFlags { bits }
+    }
+
+    #[inline]
     pub fn set(&mut self, bit: u16) {
         self.bits |= bit;
     }
@@ -119,16 +124,21 @@ pub struct AlleleOp {
     pub alt_len: u32,
     pub trim_beg: u16,
     pub len_diff: i32,
+    pub case_flags: u8,
 }
 
+pub const ALLELE_HAS_ASCII_LOWER: u8 = 1 << 0;
+pub const ALLELE_HAS_ASCII_UPPER: u8 = 1 << 1;
+
 impl AlleleOp {
-    pub fn ref_op(ref_len: u32) -> Self {
+    pub fn ref_op(ref_len: u32, ref_allele: &[u8]) -> Self {
         AlleleOp {
             kind: AlleleOpKind::Ref,
             ref_len,
             alt_len: ref_len,
             trim_beg: 0,
             len_diff: 0,
+            case_flags: allele_case_flags(ref_allele),
         }
     }
 
@@ -145,6 +155,16 @@ impl AlleleOp {
             self.kind,
             AlleleOpKind::SameLen | AlleleOpKind::Insert | AlleleOpKind::Delete
         )
+    }
+
+    #[inline]
+    pub fn has_ascii_lowercase(&self) -> bool {
+        self.case_flags & ALLELE_HAS_ASCII_LOWER != 0
+    }
+
+    #[inline]
+    pub fn has_ascii_uppercase(&self) -> bool {
+        self.case_flags & ALLELE_HAS_ASCII_UPPER != 0
     }
 }
 
@@ -167,7 +187,7 @@ impl CompiledRecord {
         }
 
         let mut ops: SmallVec<[AlleleOp; 2]> = SmallVec::with_capacity(alleles.len().max(1));
-        ops.push(AlleleOp::ref_op(ref_len));
+        ops.push(AlleleOp::ref_op(ref_len, ref_allele));
         for alt in alleles.iter().skip(1) {
             let op = compile_alt_op(ref_allele, ref_len, alt);
             if matches!(
@@ -229,6 +249,7 @@ pub struct VcfCompileStats {
     pub multi_allelic_records: u64,
     pub gt_records: u64,
     pub biallelic_phased_diploid_records: u64,
+    pub compact_gt_records: u64,
     pub biallelic_gt_bitset_records: u64,
     pub missing_gt_records: u64,
 }
@@ -252,6 +273,7 @@ impl VcfCompileStats {
         &mut self,
         has_gt: bool,
         is_biallelic_phased_diploid: bool,
+        has_compact_gt: bool,
         has_biallelic_gt_bitset: bool,
         has_missing: bool,
     ) {
@@ -260,6 +282,9 @@ impl VcfCompileStats {
         }
         if is_biallelic_phased_diploid {
             self.biallelic_phased_diploid_records += 1;
+        }
+        if has_compact_gt {
+            self.compact_gt_records += 1;
         }
         if has_biallelic_gt_bitset {
             self.biallelic_gt_bitset_records += 1;
@@ -306,6 +331,7 @@ impl VcfCompileStats {
             "biallelic_phased_diploid_records={}",
             self.biallelic_phased_diploid_records
         ));
+        lines.push(format!("compact_gt_records={}", self.compact_gt_records));
         lines.push(format!(
             "biallelic_gt_bitset_records={}",
             self.biallelic_gt_bitset_records
@@ -317,6 +343,7 @@ impl VcfCompileStats {
 
 fn compile_alt_op(ref_allele: &[u8], ref_len: u32, alt: &[u8]) -> AlleleOp {
     let alt_len = alt.len() as u32;
+    let case_flags = allele_case_flags(alt);
     if alt.eq_ignore_ascii_case(b"<DEL>") {
         return AlleleOp {
             kind: AlleleOpKind::SymbolicDel,
@@ -324,6 +351,7 @@ fn compile_alt_op(ref_allele: &[u8], ref_len: u32, alt: &[u8]) -> AlleleOp {
             alt_len: 1,
             trim_beg: 1,
             len_diff: 1 - ref_len as i32,
+            case_flags,
         };
     }
     if alt.eq_ignore_ascii_case(b"<*>") || alt.eq_ignore_ascii_case(b"<NON_REF>") {
@@ -333,6 +361,7 @@ fn compile_alt_op(ref_allele: &[u8], ref_len: u32, alt: &[u8]) -> AlleleOp {
             alt_len,
             trim_beg: 0,
             len_diff: 0,
+            case_flags,
         };
     }
     if alt.starts_with(b"<") || alt == b"*" || alt.is_empty() {
@@ -342,6 +371,7 @@ fn compile_alt_op(ref_allele: &[u8], ref_len: u32, alt: &[u8]) -> AlleleOp {
             alt_len,
             trim_beg: 0,
             len_diff: alt_len as i32 - ref_len as i32,
+            case_flags,
         };
     }
 
@@ -369,7 +399,20 @@ fn compile_alt_op(ref_allele: &[u8], ref_len: u32, alt: &[u8]) -> AlleleOp {
         alt_len,
         trim_beg,
         len_diff,
+        case_flags,
     }
+}
+
+pub fn allele_case_flags(bytes: &[u8]) -> u8 {
+    let mut flags = 0u8;
+    for &b in bytes {
+        if b.is_ascii_lowercase() {
+            flags |= ALLELE_HAS_ASCII_LOWER;
+        } else if b.is_ascii_uppercase() {
+            flags |= ALLELE_HAS_ASCII_UPPER;
+        }
+    }
+    flags
 }
 
 fn classify_record_kind(ops: &[AlleleOp], n_alt: usize) -> RecordKind {

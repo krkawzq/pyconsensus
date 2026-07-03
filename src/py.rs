@@ -137,7 +137,7 @@ struct PyConsensusResult {
     chain: Option<String>,
 }
 
-#[pyclass(module = "pyconsensus._engine", name = "_ConsensusEngine", subclassable)]
+#[pyclass(module = "pyconsensus._engine", name = "_ConsensusEngine", subclass)]
 struct PyConsensusEngine {
     inner: Arc<ConsensusEngine>,
 }
@@ -205,7 +205,7 @@ impl PyConsensusEngine {
             .map(|(k, v)| (k, PathBuf::from(v)))
             .collect();
         let engine =
-            ConsensusEngine::load(ref_path, vcf_paths, opts).map_err(|e| PyIOError::new_err(e))?;
+            ConsensusEngine::load(ref_path, vcf_paths, opts).map_err(PyIOError::new_err)?;
         Ok(PyConsensusEngine {
             inner: Arc::new(engine),
         })

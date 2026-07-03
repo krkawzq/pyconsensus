@@ -9,9 +9,11 @@
 //! (INT8/INT16/INT32) into a flat encoded int32 array; we only replicate the
 //! `bcf_gt_*` bit operations in Rust (see `htslib_ffi`).
 
-use crate::compiled::{CompiledRecord, VcfCompileStats};
+use crate::compiled::{
+    AlleleOp, AlleleOpKind, CompiledRecord, RecordFlags, RecordKind, VcfCompileStats,
+};
 use crate::htslib_ffi as ffi;
-use crate::planner::{plan_region, PlanOptions, RegionPlan};
+use crate::planner::{plan_region, plan_region_set, PlanOptions, RegionPlan};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -22,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const CVCF_MAGIC: &[u8; 8] = b"CVCF0001";
-const CVCF_VERSION: u32 = 2;
+const CVCF_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceFingerprint {
@@ -40,6 +42,81 @@ pub struct GtAllele {
     pub phased: bool,
     /// Original htslib-encoded GT int32, kept for exact diffing / diagnostics.
     pub raw: i32,
+}
+
+const COMPACT_GT_ALLELE_MASK: u16 = 0x3fff;
+const COMPACT_GT_MISSING: u16 = 0x4000;
+const COMPACT_GT_PHASED: u16 = 0x8000;
+
+/// Compact general GT store for non-bitset selection paths.
+///
+/// Each GT allele is encoded in one u16: lower 14 bits store allele index,
+/// bit 14 marks missing, and bit 15 stores the phased flag. Normal haplotype
+/// fallback selection walks this contiguous representation; the legacy
+/// `GtAllele` matrix is kept only when an allele index cannot fit here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactGt {
+    sample_offsets: Vec<u32>,
+    codes: Vec<u16>,
+}
+
+impl CompactGt {
+    pub fn from_gt(n_samples: usize, gt: &[SmallVec<[GtAllele; 2]>]) -> Option<Self> {
+        if n_samples == 0 || gt.is_empty() || gt.len() != n_samples {
+            return None;
+        }
+        let mut sample_offsets = Vec::with_capacity(n_samples + 1);
+        let mut codes = Vec::new();
+        sample_offsets.push(0);
+        for sample_gt in gt {
+            for allele in sample_gt {
+                let mut code = if let Some(idx) = allele.allele {
+                    if idx < 0 || idx > COMPACT_GT_ALLELE_MASK as i32 {
+                        return None;
+                    }
+                    idx as u16
+                } else {
+                    COMPACT_GT_MISSING
+                };
+                if allele.phased {
+                    code |= COMPACT_GT_PHASED;
+                }
+                codes.push(code);
+            }
+            let offset = u32::try_from(codes.len()).ok()?;
+            sample_offsets.push(offset);
+        }
+        Some(CompactGt {
+            sample_offsets,
+            codes,
+        })
+    }
+
+    #[inline]
+    pub fn n_samples(&self) -> usize {
+        self.sample_offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn sample(&self, sample_idx: usize) -> Option<&[u16]> {
+        let start = *self.sample_offsets.get(sample_idx)? as usize;
+        let end = *self.sample_offsets.get(sample_idx + 1)? as usize;
+        self.codes.get(start..end)
+    }
+
+    #[inline]
+    pub fn allele(code: u16) -> Option<i32> {
+        if code & COMPACT_GT_MISSING != 0 {
+            None
+        } else {
+            Some((code & COMPACT_GT_ALLELE_MASK) as i32)
+        }
+    }
+
+    #[inline]
+    pub fn phased(code: u16) -> bool {
+        code & COMPACT_GT_PHASED != 0
+    }
 }
 
 /// Fast genotype representation for biallelic diploid records.
@@ -126,6 +203,20 @@ impl BiallelicPhasedGtBits {
             _ => None,
         }
     }
+
+    #[inline]
+    pub fn alt_words_for_hap(&self, hap: usize) -> Option<&[u64]> {
+        match hap {
+            1 => Some(&self.hap1_alt),
+            2 => Some(&self.hap2_alt),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn missing_words(&self) -> &[u64] {
+        &self.missing
+    }
 }
 
 /// A preprocessed VCF record. Alleles are REF + ALTs; GT is per-sample.
@@ -139,9 +230,11 @@ pub struct VcfRecord {
     pub rid: i32,
     /// REF + ALTs, variable count, each variable length.
     pub alleles: Vec<SmallVec<[u8; 16]>>,
-    /// Per-sample GT; `len == n_sample` when the VCF has GT, else empty.
-    /// Ploidy is variable per sample.
+    /// Rare raw-GT fallback. Common records use `gt_compact`/`gt_bits` and keep
+    /// this empty to avoid carrying a cache-cold matrix through runtime.
     pub gt: Vec<SmallVec<[GtAllele; 2]>>,
+    /// Compact GT fallback store for general selection modes.
+    pub gt_compact: Option<CompactGt>,
     /// Bitset GT fastpath for biallelic phased diploid records.
     pub gt_bits: Option<BiallelicPhasedGtBits>,
     /// `bcf_get_variant_types` bitmask (VCF_SNP|MNP|INDEL|...), precomputed.
@@ -149,6 +242,150 @@ pub struct VcfRecord {
     /// Preclassified record/allele metadata used by fastpath dispatch.
     pub compiled: CompiledRecord,
 }
+
+pub enum RecordSet<'a> {
+    RefSlice(&'a [&'a VcfRecord]),
+    IndexSlice {
+        records: &'a [VcfRecord],
+        idx: &'a [u32],
+    },
+    IndexFilteredPrefixAndSlice {
+        records: &'a [VcfRecord],
+        prefix_idx: &'a [u32],
+        idx: &'a [u32],
+        start: i64,
+        end: i64,
+        prefix_len: usize,
+    },
+    Empty,
+}
+
+pub enum RecordSetIter<'a, 's> {
+    RefSlice(std::iter::Copied<std::slice::Iter<'s, &'a VcfRecord>>),
+    IndexSlice {
+        records: &'a [VcfRecord],
+        iter: std::slice::Iter<'s, u32>,
+    },
+    IndexFilteredPrefixAndSlice {
+        records: &'a [VcfRecord],
+        prefix_iter: std::slice::Iter<'s, u32>,
+        idx_iter: std::slice::Iter<'s, u32>,
+        start: i64,
+        end: i64,
+        prefix_remaining: usize,
+    },
+    Empty,
+}
+
+impl<'a> RecordSet<'a> {
+    pub fn from_ref_slice(records: &'a [&'a VcfRecord]) -> Self {
+        if records.is_empty() {
+            RecordSet::Empty
+        } else {
+            RecordSet::RefSlice(records)
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            RecordSet::RefSlice(records) => records.len(),
+            RecordSet::IndexSlice { idx, .. } => idx.len(),
+            RecordSet::IndexFilteredPrefixAndSlice {
+                prefix_len, idx, ..
+            } => prefix_len + idx.len(),
+            RecordSet::Empty => 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> RecordSetIter<'a, '_> {
+        match self {
+            RecordSet::RefSlice(records) => RecordSetIter::RefSlice(records.iter().copied()),
+            RecordSet::IndexSlice { records, idx } => RecordSetIter::IndexSlice {
+                records,
+                iter: idx.iter(),
+            },
+            RecordSet::IndexFilteredPrefixAndSlice {
+                records,
+                prefix_idx,
+                idx,
+                start,
+                end,
+                prefix_len,
+            } => RecordSetIter::IndexFilteredPrefixAndSlice {
+                records,
+                prefix_iter: prefix_idx.iter(),
+                idx_iter: idx.iter(),
+                start: *start,
+                end: *end,
+                prefix_remaining: *prefix_len,
+            },
+            RecordSet::Empty => RecordSetIter::Empty,
+        }
+    }
+
+    pub fn to_refs(&self) -> Vec<&'a VcfRecord> {
+        self.iter().collect()
+    }
+}
+
+impl<'a> Iterator for RecordSetIter<'a, '_> {
+    type Item = &'a VcfRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RecordSetIter::RefSlice(iter) => iter.next(),
+            RecordSetIter::IndexSlice { records, iter } => {
+                iter.next().map(|&i| &records[i as usize])
+            }
+            RecordSetIter::IndexFilteredPrefixAndSlice {
+                records,
+                prefix_iter,
+                idx_iter,
+                start,
+                end,
+                prefix_remaining,
+            } => {
+                for &i in prefix_iter.by_ref() {
+                    let rec = &records[i as usize];
+                    if rec.pos <= *end && rec.ref_end() >= *start {
+                        *prefix_remaining -= 1;
+                        return Some(rec);
+                    }
+                }
+                *prefix_remaining = 0;
+                idx_iter.next().map(|&i| &records[i as usize])
+            }
+            RecordSetIter::Empty => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RecordSetIter::RefSlice(iter) => iter.size_hint(),
+            RecordSetIter::IndexSlice { iter, .. } => iter.size_hint(),
+            RecordSetIter::IndexFilteredPrefixAndSlice {
+                idx_iter,
+                prefix_remaining,
+                ..
+            } => {
+                let (i_lo, i_hi) = idx_iter.size_hint();
+                (
+                    *prefix_remaining + i_lo,
+                    i_hi.map(|i| *prefix_remaining + i),
+                )
+            }
+            RecordSetIter::Empty => (0, Some(0)),
+        }
+    }
+}
+
+impl ExactSizeIterator for RecordSetIter<'_, '_> {}
 
 impl VcfRecord {
     /// 0-based inclusive end of the REF span: `pos + rlen - 1`.
@@ -274,16 +511,20 @@ impl VcfStore {
     /// span overlaps (approximated as record span for biallelic SNP/indel; see
     /// docs §3). Never misses a deletion/MNP whose `pos < start` but spans in.
     pub fn query(&self, chr: &str, start: i64, end: i64, overlap: u8) -> Vec<&VcfRecord> {
+        self.query_set(chr, start, end, overlap).to_refs()
+    }
+
+    pub fn query_set(&self, chr: &str, start: i64, end: i64, overlap: u8) -> RecordSet<'_> {
         let rid = match self.seq_names.get(chr) {
             Some(r) => *r,
-            None => return Vec::new(),
+            None => return RecordSet::Empty,
         };
         let idx = match self.by_rid.get(&rid) {
             Some(v) => v,
-            None => return Vec::new(),
+            None => return RecordSet::Empty,
         };
         if idx.is_empty() {
-            return Vec::new();
+            return RecordSet::Empty;
         }
         let pmax = self
             .pmax_end
@@ -300,33 +541,60 @@ impl VcfStore {
         } else {
             lo_pos
         };
-        let base_cap = hi.saturating_sub(lo_pos);
-        let span_cap = lo_pos.saturating_sub(first_spanning);
-        let mut out: Vec<&VcfRecord> = Vec::with_capacity(base_cap + span_cap);
         match overlap {
             0 => {
-                for k in lo_pos..hi {
-                    out.push(&self.records[idx[k] as usize]);
+                if lo_pos == hi {
+                    RecordSet::Empty
+                } else {
+                    RecordSet::IndexSlice {
+                        records: &self.records,
+                        idx: &idx[lo_pos..hi],
+                    }
                 }
             }
             1 | 2 => {
-                // Records with pos < start that still span into [start, end].
-                if lo_pos > 0 {
-                    for k in first_spanning..lo_pos {
-                        let rec = &self.records[idx[k] as usize];
-                        if rec.pos <= end && rec.ref_end() >= start {
-                            out.push(rec);
-                        }
+                if first_spanning == lo_pos {
+                    if lo_pos == hi {
+                        return RecordSet::Empty;
+                    }
+                    return RecordSet::IndexSlice {
+                        records: &self.records,
+                        idx: &idx[lo_pos..hi],
+                    };
+                }
+
+                let prefix_idx = &idx[first_spanning..lo_pos];
+                let mut prefix_len = 0usize;
+                for &i in prefix_idx {
+                    let rec = &self.records[i as usize];
+                    if rec.pos <= end && rec.ref_end() >= start {
+                        prefix_len += 1;
                     }
                 }
                 // Records with pos in [start, end]: ref_end >= pos >= start, always overlap.
-                for k in lo_pos..hi {
-                    out.push(&self.records[idx[k] as usize]);
+                let tail = &idx[lo_pos..hi];
+                if prefix_len == 0 {
+                    if tail.is_empty() {
+                        RecordSet::Empty
+                    } else {
+                        RecordSet::IndexSlice {
+                            records: &self.records,
+                            idx: tail,
+                        }
+                    }
+                } else {
+                    RecordSet::IndexFilteredPrefixAndSlice {
+                        records: &self.records,
+                        prefix_idx,
+                        idx: tail,
+                        start,
+                        end,
+                        prefix_len,
+                    }
                 }
             }
-            _ => return Vec::new(),
+            _ => RecordSet::Empty,
         }
-        out
     }
 
     pub fn plan_query(
@@ -339,6 +607,19 @@ impl VcfStore {
     ) -> (Vec<&VcfRecord>, RegionPlan) {
         let records = self.query(chr, start, end, overlap);
         let plan = plan_region(&records, opts);
+        (records, plan)
+    }
+
+    pub fn plan_query_set(
+        &self,
+        chr: &str,
+        start: i64,
+        end: i64,
+        overlap: u8,
+        opts: PlanOptions,
+    ) -> (RecordSet<'_>, RegionPlan) {
+        let records = self.query_set(chr, start, end, overlap);
+        let plan = plan_region_set(&records, opts);
         (records, plan)
     }
 
@@ -414,7 +695,7 @@ impl VcfStore {
 
         let n_records = read_len64(&mut r)?;
         store.records.reserve(n_records);
-        for record_idx in 0..n_records {
+        for _ in 0..n_records {
             let pos = read_i64(&mut r)?;
             let rlen = read_i32(&mut r)?;
             let rid = read_i32(&mut r)?;
@@ -426,6 +707,7 @@ impl VcfStore {
                 let bytes = read_bytes(&mut r)?;
                 alleles.push(SmallVec::from_slice(&bytes));
             }
+            let compiled = read_compiled_record(&mut r)?;
 
             let n_gt_samples = read_len(&mut r)?;
             let mut gt: Vec<SmallVec<[GtAllele; 2]>> = Vec::with_capacity(n_gt_samples);
@@ -450,32 +732,33 @@ impl VcfStore {
                 gt.push(sample_gt);
             }
 
-            let compiled = CompiledRecord::from_alleles(rlen, &alleles);
+            let gt_compact = read_compact_gt(&mut r)?;
+            let gt_bits = read_gt_bits(&mut r)?;
             store.compile_stats.observe_record(&compiled);
             let (has_gt, is_biallelic_phased_diploid, has_missing_gt) =
-                gt_compile_stats(n_allele, &gt);
-            let gt_bits = BiallelicPhasedGtBits::from_gt(n_allele, store.n_sample as usize, &gt);
+                gt_compile_stats_from_stores(n_allele, &gt, gt_compact.as_ref());
             store.compile_stats.observe_gt(
                 has_gt,
                 is_biallelic_phased_diploid,
+                gt_compact.is_some(),
                 gt_bits.is_some(),
                 has_missing_gt,
             );
             store.has_gt |= has_gt;
 
-            store.by_rid.entry(rid).or_default().push(record_idx as u32);
             store.records.push(VcfRecord {
                 pos,
                 rlen,
                 rid,
                 alleles,
                 gt,
+                gt_compact,
                 gt_bits,
                 var_type,
                 compiled,
             });
         }
-        store.rebuild_pmax_end();
+        read_coord_index(&mut r, &mut store)?;
         Ok(store)
     }
 
@@ -511,6 +794,7 @@ impl VcfStore {
             for allele in &rec.alleles {
                 write_bytes(&mut w, allele)?;
             }
+            write_compiled_record(&mut w, &rec.compiled)?;
 
             write_len(&mut w, rec.gt.len())?;
             for sample_gt in &rec.gt {
@@ -524,7 +808,10 @@ impl VcfStore {
                     write_i32(&mut w, gt.raw)?;
                 }
             }
+            write_compact_gt(&mut w, rec.gt_compact.as_ref())?;
+            write_gt_bits(&mut w, rec.gt_bits.as_ref())?;
         }
+        write_coord_index(&mut w, self)?;
         w.flush()
     }
 
@@ -647,60 +934,23 @@ impl VcfStore {
                     &mut gt_cap,
                     ffi::BCF_HT_INT,
                 );
-                let mut gt: Vec<SmallVec<[GtAllele; 2]>> = Vec::new();
-                let mut has_missing_gt = false;
-                let mut is_biallelic_phased_diploid = n_allele == 2;
-                if ngt > 0 && self.n_sample > 0 && !gt_buf.is_null() {
-                    self.has_gt = true;
-                    gt.reserve_exact(self.n_sample as usize);
-                    // bcf_get_format_values returns nsmpl*max_ploidy (the total
-                    // number of int32 values), so per-sample ploidy is:
-                    let ploidy = (ngt as usize) / (self.n_sample as usize);
-                    let base = gt_buf as *const i32;
-                    for s in 0..self.n_sample as usize {
-                        let mut alleles_g: SmallVec<[GtAllele; 2]> = SmallVec::new();
-                        for j in 0..ploidy {
-                            let raw = *base.add(s * ploidy + j);
-                            if raw == ffi::BCF_INT32_VECTOR_END {
-                                break;
-                            }
-                            // Note: BCF_INT32_MISSING (-2147483648) should not
-                            // appear in GT-encoded arrays (missing there = 0),
-                            // but guard anyway.
-                            let allele = if ffi::gt_is_missing(raw) {
-                                has_missing_gt = true;
-                                None
-                            } else {
-                                Some(ffi::gt_allele(raw))
-                            };
-                            alleles_g.push(GtAllele {
-                                allele,
-                                phased: ffi::gt_is_phased(raw),
-                                raw,
-                            });
-                        }
-                        if alleles_g.len() != 2
-                            || alleles_g.iter().any(|a| a.allele.is_none())
-                            || !alleles_g.iter().all(|a| a.phased)
-                        {
-                            is_biallelic_phased_diploid = false;
-                        }
-                        gt.push(alleles_g);
-                    }
-                } else {
-                    is_biallelic_phased_diploid = false;
-                }
+                let decoded_gt = decode_gt_stores(
+                    n_allele as usize,
+                    self.n_sample as usize,
+                    ngt,
+                    gt_buf.cast::<i32>(),
+                );
+                self.has_gt |= decoded_gt.has_gt;
 
                 let var_type = ffi::bcf_get_variant_types(rec);
                 let compiled = CompiledRecord::from_alleles(rlen, &alleles);
-                let gt_bits =
-                    BiallelicPhasedGtBits::from_gt(n_allele as usize, self.n_sample as usize, &gt);
                 self.compile_stats.observe_record(&compiled);
                 self.compile_stats.observe_gt(
-                    !gt.is_empty(),
-                    is_biallelic_phased_diploid,
-                    gt_bits.is_some(),
-                    has_missing_gt,
+                    decoded_gt.has_gt,
+                    decoded_gt.is_biallelic_phased_diploid,
+                    decoded_gt.gt_compact.is_some(),
+                    decoded_gt.gt_bits.is_some(),
+                    decoded_gt.has_missing_gt,
                 );
 
                 let rid_bucket = self.by_rid.entry(rid).or_default();
@@ -710,8 +960,9 @@ impl VcfStore {
                     rlen,
                     rid,
                     alleles,
-                    gt,
-                    gt_bits,
+                    gt: decoded_gt.gt,
+                    gt_compact: decoded_gt.gt_compact,
+                    gt_bits: decoded_gt.gt_bits,
                     var_type,
                     compiled,
                 });
@@ -747,6 +998,227 @@ fn source_fingerprint(path: &Path) -> io::Result<SourceFingerprint> {
         mtime_secs: duration.as_secs() as i64,
         mtime_nanos: duration.subsec_nanos(),
     })
+}
+
+struct DecodedGtStores {
+    gt: Vec<SmallVec<[GtAllele; 2]>>,
+    gt_compact: Option<CompactGt>,
+    gt_bits: Option<BiallelicPhasedGtBits>,
+    has_gt: bool,
+    is_biallelic_phased_diploid: bool,
+    has_missing_gt: bool,
+}
+
+fn decode_gt_stores(
+    n_allele: usize,
+    n_samples: usize,
+    ngt: c_int,
+    base: *const i32,
+) -> DecodedGtStores {
+    if ngt <= 0 || n_samples == 0 || base.is_null() {
+        return DecodedGtStores {
+            gt: Vec::new(),
+            gt_compact: None,
+            gt_bits: None,
+            has_gt: false,
+            is_biallelic_phased_diploid: false,
+            has_missing_gt: false,
+        };
+    }
+
+    // bcf_get_format_values returns nsmpl*max_ploidy int32 values.
+    let ploidy = (ngt as usize) / n_samples;
+    let mut compact_offsets = Vec::with_capacity(n_samples + 1);
+    let mut compact_codes = Vec::with_capacity(ngt as usize);
+    compact_offsets.push(0);
+    let mut compact_ok = true;
+    let mut has_missing_gt = false;
+    let mut is_biallelic_phased_diploid = n_allele == 2;
+    let mut gt_bits = (n_allele == 2).then(|| BiallelicPhasedGtBits {
+        n_samples,
+        hap1_alt: vec![0; n_samples.div_ceil(64)],
+        hap2_alt: vec![0; n_samples.div_ceil(64)],
+        missing: vec![0; n_samples.div_ceil(64)],
+    });
+
+    for sample_idx in 0..n_samples {
+        let mut sample_len = 0usize;
+        let mut hap_raw = [0i32; 2];
+        for j in 0..ploidy {
+            let raw = unsafe { *base.add(sample_idx * ploidy + j) };
+            if raw == ffi::BCF_INT32_VECTOR_END {
+                break;
+            }
+            if sample_len < 2 {
+                hap_raw[sample_len] = raw;
+            }
+            sample_len += 1;
+
+            if ffi::gt_is_missing(raw) {
+                has_missing_gt = true;
+            }
+            if compact_ok {
+                match compact_gt_code(raw) {
+                    Some(code) => compact_codes.push(code),
+                    None => {
+                        compact_ok = false;
+                        compact_offsets.clear();
+                        compact_codes.clear();
+                    }
+                }
+            }
+        }
+
+        if compact_ok {
+            if let Ok(offset) = u32::try_from(compact_codes.len()) {
+                compact_offsets.push(offset);
+            } else {
+                compact_ok = false;
+                compact_offsets.clear();
+                compact_codes.clear();
+            }
+        }
+
+        if is_biallelic_phased_diploid && sample_len != 2 {
+            is_biallelic_phased_diploid = false;
+        }
+        if let Some(bits) = gt_bits.as_mut() {
+            if sample_len != 2 {
+                gt_bits = None;
+                continue;
+            }
+            let word = sample_idx / 64;
+            let bit = 1u64 << (sample_idx & 63);
+            let a0_missing = ffi::gt_is_missing(hap_raw[0]);
+            let a1_missing = ffi::gt_is_missing(hap_raw[1]);
+            if a0_missing || a1_missing {
+                bits.missing[word] |= bit;
+                is_biallelic_phased_diploid = false;
+                continue;
+            }
+            let h0 = ffi::gt_allele(hap_raw[0]);
+            let h1 = ffi::gt_allele(hap_raw[1]);
+            if !ffi::gt_is_phased(hap_raw[0])
+                || !ffi::gt_is_phased(hap_raw[1])
+                || !(0..=1).contains(&h0)
+                || !(0..=1).contains(&h1)
+            {
+                gt_bits = None;
+                is_biallelic_phased_diploid = false;
+                continue;
+            }
+            if h0 == 1 {
+                bits.hap1_alt[word] |= bit;
+            }
+            if h1 == 1 {
+                bits.hap2_alt[word] |= bit;
+            }
+        }
+    }
+
+    let gt_compact = compact_ok.then_some(CompactGt {
+        sample_offsets: compact_offsets,
+        codes: compact_codes,
+    });
+    let gt = if gt_compact.is_some() {
+        Vec::new()
+    } else {
+        decode_raw_gt_matrix(n_samples, ngt, base)
+    };
+
+    DecodedGtStores {
+        gt,
+        gt_compact,
+        gt_bits,
+        has_gt: true,
+        is_biallelic_phased_diploid,
+        has_missing_gt,
+    }
+}
+
+#[inline]
+fn compact_gt_code(raw: i32) -> Option<u16> {
+    let mut code = if ffi::gt_is_missing(raw) {
+        COMPACT_GT_MISSING
+    } else {
+        let idx = ffi::gt_allele(raw);
+        if idx < 0 || idx > COMPACT_GT_ALLELE_MASK as i32 {
+            return None;
+        }
+        idx as u16
+    };
+    if ffi::gt_is_phased(raw) {
+        code |= COMPACT_GT_PHASED;
+    }
+    Some(code)
+}
+
+fn decode_raw_gt_matrix(
+    n_samples: usize,
+    ngt: c_int,
+    base: *const i32,
+) -> Vec<SmallVec<[GtAllele; 2]>> {
+    let ploidy = (ngt as usize) / n_samples;
+    let mut gt = Vec::with_capacity(n_samples);
+    for sample_idx in 0..n_samples {
+        let mut sample_gt: SmallVec<[GtAllele; 2]> = SmallVec::new();
+        for j in 0..ploidy {
+            let raw = unsafe { *base.add(sample_idx * ploidy + j) };
+            if raw == ffi::BCF_INT32_VECTOR_END {
+                break;
+            }
+            let allele = if ffi::gt_is_missing(raw) {
+                None
+            } else {
+                Some(ffi::gt_allele(raw))
+            };
+            sample_gt.push(GtAllele {
+                allele,
+                phased: ffi::gt_is_phased(raw),
+                raw,
+            });
+        }
+        gt.push(sample_gt);
+    }
+    gt
+}
+
+fn gt_compile_stats_from_stores(
+    n_allele: usize,
+    gt: &[SmallVec<[GtAllele; 2]>],
+    compact: Option<&CompactGt>,
+) -> (bool, bool, bool) {
+    if !gt.is_empty() {
+        return gt_compile_stats(n_allele, gt);
+    }
+    let Some(compact) = compact else {
+        return (false, false, false);
+    };
+    let mut has_missing = false;
+    let mut is_biallelic_phased_diploid = n_allele == 2;
+    for sample_idx in 0..compact.n_samples() {
+        let Some(sample_gt) = compact.sample(sample_idx) else {
+            is_biallelic_phased_diploid = false;
+            continue;
+        };
+        if sample_gt.len() != 2 {
+            is_biallelic_phased_diploid = false;
+        }
+        for &code in sample_gt {
+            match CompactGt::allele(code) {
+                Some(allele) => {
+                    if !CompactGt::phased(code) || (n_allele == 2 && !(0..=1).contains(&allele)) {
+                        is_biallelic_phased_diploid = false;
+                    }
+                }
+                None => {
+                    has_missing = true;
+                    is_biallelic_phased_diploid = false;
+                }
+            }
+        }
+    }
+    (true, is_biallelic_phased_diploid, has_missing)
 }
 
 fn gt_compile_stats(n_allele: usize, gt: &[SmallVec<[GtAllele; 2]>]) -> (bool, bool, bool) {
@@ -836,6 +1308,376 @@ fn write_bytes<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
+fn read_compiled_record<R: Read>(r: &mut R) -> io::Result<CompiledRecord> {
+    let kind = read_record_kind(r)?;
+    let flags = RecordFlags::from_bits(read_u16(r)?);
+    let n_ops = read_len(r)?;
+    if n_ops > (1usize << 20) {
+        return Err(invalid_data("compiled op table too large"));
+    }
+    let mut ops: SmallVec<[AlleleOp; 2]> = SmallVec::with_capacity(n_ops);
+    for _ in 0..n_ops {
+        ops.push(AlleleOp {
+            kind: read_allele_op_kind(r)?,
+            ref_len: read_u32(r)?,
+            alt_len: read_u32(r)?,
+            trim_beg: read_u16(r)?,
+            len_diff: read_i32(r)?,
+            case_flags: read_u8(r)?,
+        });
+    }
+    Ok(CompiledRecord { kind, flags, ops })
+}
+
+fn write_compiled_record<W: Write>(w: &mut W, compiled: &CompiledRecord) -> io::Result<()> {
+    write_u8(w, compiled.kind as u8)?;
+    write_u16(w, compiled.flags.bits())?;
+    write_len(w, compiled.ops.len())?;
+    for op in &compiled.ops {
+        write_u8(w, op.kind as u8)?;
+        write_u32(w, op.ref_len)?;
+        write_u32(w, op.alt_len)?;
+        write_u16(w, op.trim_beg)?;
+        write_i32(w, op.len_diff)?;
+        write_u8(w, op.case_flags)?;
+    }
+    Ok(())
+}
+
+fn read_record_kind<R: Read>(r: &mut R) -> io::Result<RecordKind> {
+    match read_u8(r)? {
+        0 => Ok(RecordKind::RefOnly),
+        1 => Ok(RecordKind::Snp1),
+        2 => Ok(RecordKind::SameLen),
+        3 => Ok(RecordKind::NormInsertion),
+        4 => Ok(RecordKind::NormDeletion),
+        5 => Ok(RecordKind::SimpleIndel),
+        6 => Ok(RecordKind::SymbolicDel),
+        7 => Ok(RecordKind::GvcfBlock),
+        8 => Ok(RecordKind::Complex),
+        _ => Err(invalid_data("invalid record kind")),
+    }
+}
+
+fn read_allele_op_kind<R: Read>(r: &mut R) -> io::Result<AlleleOpKind> {
+    match read_u8(r)? {
+        0 => Ok(AlleleOpKind::Ref),
+        1 => Ok(AlleleOpKind::SameLen),
+        2 => Ok(AlleleOpKind::Insert),
+        3 => Ok(AlleleOpKind::Delete),
+        4 => Ok(AlleleOpKind::Replace),
+        5 => Ok(AlleleOpKind::SymbolicDel),
+        6 => Ok(AlleleOpKind::GvcfRefBlock),
+        7 => Ok(AlleleOpKind::Missing),
+        8 => Ok(AlleleOpKind::Unsupported),
+        _ => Err(invalid_data("invalid allele op kind")),
+    }
+}
+
+fn read_compact_gt<R: Read>(r: &mut R) -> io::Result<Option<CompactGt>> {
+    if !read_bool(r)? {
+        return Ok(None);
+    }
+    let sample_offsets = read_u32_vec(r)?;
+    let codes = read_u16_vec(r)?;
+    if sample_offsets.is_empty() || sample_offsets[0] != 0 {
+        return Err(invalid_data("invalid compact GT offsets"));
+    }
+    let mut prev = 0u32;
+    for &offset in &sample_offsets {
+        if offset < prev || offset as usize > codes.len() {
+            return Err(invalid_data("invalid compact GT offset order"));
+        }
+        prev = offset;
+    }
+    if sample_offsets.last().copied().unwrap_or(0) as usize != codes.len() {
+        return Err(invalid_data("compact GT offsets do not cover codes"));
+    }
+    Ok(Some(CompactGt {
+        sample_offsets,
+        codes,
+    }))
+}
+
+fn write_compact_gt<W: Write>(w: &mut W, compact: Option<&CompactGt>) -> io::Result<()> {
+    let Some(compact) = compact else {
+        return write_bool(w, false);
+    };
+    write_bool(w, true)?;
+    write_u32_slice(w, &compact.sample_offsets)?;
+    write_u16_slice(w, &compact.codes)
+}
+
+fn read_gt_bits<R: Read>(r: &mut R) -> io::Result<Option<BiallelicPhasedGtBits>> {
+    if !read_bool(r)? {
+        return Ok(None);
+    }
+    let n_samples = read_len(r)?;
+    let hap1_alt = read_u64_vec(r)?;
+    let hap2_alt = read_u64_vec(r)?;
+    let missing = read_u64_vec(r)?;
+    let expected_words = n_samples.div_ceil(64);
+    if hap1_alt.len() != expected_words
+        || hap2_alt.len() != expected_words
+        || missing.len() != expected_words
+    {
+        return Err(invalid_data("invalid gt bitset length"));
+    }
+    Ok(Some(BiallelicPhasedGtBits {
+        n_samples,
+        hap1_alt,
+        hap2_alt,
+        missing,
+    }))
+}
+
+fn write_gt_bits<W: Write>(w: &mut W, bits: Option<&BiallelicPhasedGtBits>) -> io::Result<()> {
+    let Some(bits) = bits else {
+        return write_bool(w, false);
+    };
+    write_bool(w, true)?;
+    write_len(w, bits.n_samples)?;
+    write_u64_slice(w, &bits.hap1_alt)?;
+    write_u64_slice(w, &bits.hap2_alt)?;
+    write_u64_slice(w, &bits.missing)
+}
+
+fn read_coord_index<R: Read>(r: &mut R, store: &mut VcfStore) -> io::Result<()> {
+    store.by_rid.clear();
+    store.pmax_end.clear();
+    let n_buckets = read_len(r)?;
+    store.by_rid.reserve(n_buckets);
+    store.pmax_end.reserve(n_buckets);
+    for _ in 0..n_buckets {
+        let rid = read_i32(r)?;
+        let idx = read_u32_vec(r)?;
+        let pmax = read_i64_vec(r)?;
+        if idx.len() != pmax.len() {
+            return Err(invalid_data("coord index length mismatch"));
+        }
+        let mut prev_pos = i64::MIN;
+        let mut prev_pmax = i64::MIN;
+        for (&record_idx, &pmax_value) in idx.iter().zip(&pmax) {
+            let rec = store
+                .records
+                .get(record_idx as usize)
+                .ok_or_else(|| invalid_data("coord index record out of range"))?;
+            if rec.rid != rid {
+                return Err(invalid_data("coord index rid mismatch"));
+            }
+            if rec.pos < prev_pos || pmax_value < prev_pmax || pmax_value < rec.ref_end() {
+                return Err(invalid_data("invalid coord index ordering"));
+            }
+            prev_pos = rec.pos;
+            prev_pmax = pmax_value;
+        }
+        store.by_rid.insert(rid, idx);
+        store.pmax_end.insert(rid, pmax);
+    }
+    Ok(())
+}
+
+fn write_coord_index<W: Write>(w: &mut W, store: &VcfStore) -> io::Result<()> {
+    write_len(w, store.by_rid.len())?;
+    for (&rid, idx) in &store.by_rid {
+        write_i32(w, rid)?;
+        write_u32_slice(w, idx)?;
+        let pmax = store
+            .pmax_end
+            .get(&rid)
+            .ok_or_else(|| invalid_data("missing pmax coord index"))?;
+        write_i64_slice(w, pmax)?;
+    }
+    Ok(())
+}
+
+fn read_u64_vec<R: Read>(r: &mut R) -> io::Result<Vec<u64>> {
+    let len = read_len(r)?;
+    if len > (1usize << 28) {
+        return Err(invalid_data("u64 vector too large"));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| invalid_data("u64 vector byte length overflow"))?;
+        let mut out = vec![0u64; len];
+        // The cache format is little-endian and this branch only compiles on
+        // little-endian targets; the initialized numeric buffer can be viewed as
+        // bytes for one contiguous read.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(read_u64(r)?);
+        }
+        Ok(out)
+    }
+}
+
+fn write_u64_slice<W: Write>(w: &mut W, xs: &[u64]) -> io::Result<()> {
+    write_len(w, xs.len())?;
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = xs
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| invalid_data("u64 slice byte length overflow"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            write_u64(w, x)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_u32_vec<R: Read>(r: &mut R) -> io::Result<Vec<u32>> {
+    let len = read_len(r)?;
+    if len > (1usize << 30) {
+        return Err(invalid_data("u32 vector too large"));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid_data("u32 vector byte length overflow"))?;
+        let mut out = vec![0u32; len];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(read_u32(r)?);
+        }
+        Ok(out)
+    }
+}
+
+fn write_u32_slice<W: Write>(w: &mut W, xs: &[u32]) -> io::Result<()> {
+    write_len(w, xs.len())?;
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = xs
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| invalid_data("u32 slice byte length overflow"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            write_u32(w, x)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_u16_vec<R: Read>(r: &mut R) -> io::Result<Vec<u16>> {
+    let len = read_len(r)?;
+    if len > (1usize << 30) {
+        return Err(invalid_data("u16 vector too large"));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| invalid_data("u16 vector byte length overflow"))?;
+        let mut out = vec![0u16; len];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(read_u16(r)?);
+        }
+        Ok(out)
+    }
+}
+
+fn write_u16_slice<W: Write>(w: &mut W, xs: &[u16]) -> io::Result<()> {
+    write_len(w, xs.len())?;
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = xs
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| invalid_data("u16 slice byte length overflow"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            write_u16(w, x)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_i64_vec<R: Read>(r: &mut R) -> io::Result<Vec<i64>> {
+    let len = read_len(r)?;
+    if len > (1usize << 30) {
+        return Err(invalid_data("i64 vector too large"));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or_else(|| invalid_data("i64 vector byte length overflow"))?;
+        let mut out = vec![0i64; len];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(read_i64(r)?);
+        }
+        Ok(out)
+    }
+}
+
+fn write_i64_slice<W: Write>(w: &mut W, xs: &[i64]) -> io::Result<()> {
+    write_len(w, xs.len())?;
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = xs
+            .len()
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or_else(|| invalid_data("i64 slice byte length overflow"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            write_i64(w, x)?;
+        }
+        Ok(())
+    }
+}
+
 fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
     let mut b = [0u8; 1];
     r.read_exact(&mut b)?;
@@ -844,6 +1686,16 @@ fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
 
 fn write_u8<W: Write>(w: &mut W, v: u8) -> io::Result<()> {
     w.write_all(&[v])
+}
+
+fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    r.read_exact(&mut b)?;
+    Ok(u16::from_le_bytes(b))
+}
+
+fn write_u16<W: Write>(w: &mut W, v: u16) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
 }
 
 fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
@@ -935,6 +1787,7 @@ mod tests {
         assert_eq!(store.sample_names(), &["S1", "S2"]);
         assert_eq!(store.n_records(), 3);
         assert!(store.has_gt());
+        assert_eq!(store.compile_stats().compact_gt_records, 3);
 
         let r0 = &store.records()[0];
         assert_eq!(r0.pos, 9); // 1-based 10 -> 0-based 9
@@ -942,25 +1795,34 @@ mod tests {
         assert_eq!(r0.alleles.len(), 2);
         assert_eq!(&r0.alleles[0][..], b"G");
         assert_eq!(&r0.alleles[1][..], b"A");
-        assert_eq!(r0.gt.len(), 2);
+        assert!(
+            r0.gt.is_empty(),
+            "compact GT records do not keep the raw matrix on the hot path"
+        );
         // S1 = 0|1 (phased): allele0=REF(0) phased, allele1=ALT(1) phased
-        assert_eq!(r0.gt[0][0].allele, Some(0));
-        assert!(r0.gt[0][0].phased);
-        assert_eq!(r0.gt[0][1].allele, Some(1));
+        let compact = r0.gt_compact.as_ref().expect("compact GT store");
+        let s0 = compact.sample(0).unwrap();
+        assert_eq!(s0.len(), 2);
+        assert_eq!(CompactGt::allele(s0[0]), Some(0));
+        assert!(CompactGt::phased(s0[0]));
+        assert_eq!(CompactGt::allele(s0[1]), Some(1));
+        assert!(CompactGt::phased(s0[1]));
         // S2 = 1/1 (unphased): both ALT, unphased
-        assert_eq!(r0.gt[1][0].allele, Some(1));
-        assert!(!r0.gt[1][0].phased);
+        let s1 = compact.sample(1).unwrap();
+        assert_eq!(CompactGt::allele(s1[0]), Some(1));
+        assert!(!CompactGt::phased(s1[0]));
 
         // missing GT ./.
         let r1 = &store.records()[1];
-        assert!(r1.gt[1][0].allele.is_none());
+        let compact = r1.gt_compact.as_ref().expect("compact GT store");
+        assert_eq!(CompactGt::allele(compact.sample(1).unwrap()[0]), None);
     }
 
     #[test]
     fn writes_and_reads_owned_cvcf_cache() {
         let vcf = write_vcf(
             "cache_roundtrip",
-            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1/1\n\
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|1\n\
              chr1\t20\t.\tAC\tA\t.\t.\t.\tGT\t0/0\t./.\n",
         );
         let cache_path = VcfStore::default_cache_path(&vcf);
@@ -978,10 +1840,37 @@ mod tests {
             cached.compile_stats().records_total,
             parsed.compile_stats().records_total
         );
+        assert_eq!(
+            cached.compile_stats().compact_gt_records,
+            parsed.compile_stats().compact_gt_records
+        );
         let q = cached.query("chr1", 0, 25, 1);
         assert_eq!(q.len(), 2);
         assert_eq!(&q[0].alleles[1][..], b"A");
-        assert!(q[1].gt[1][0].allele.is_none());
+        assert!(q[1].gt.is_empty());
+        assert_eq!(
+            CompactGt::allele(q[1].gt_compact.as_ref().unwrap().sample(1).unwrap()[0]),
+            None
+        );
+        let spanning = cached.query("chr1", 20, 20, 1);
+        assert_eq!(spanning.len(), 1);
+        assert_eq!(spanning[0].pos, 19);
+        assert!(cached.query("chr1", 20, 20, 0).is_empty());
+        assert_eq!(cached.records()[0].compiled, parsed.records()[0].compiled);
+        assert_eq!(cached.records()[1].compiled, parsed.records()[1].compiled);
+        let compact = cached.records()[0]
+            .gt_compact
+            .as_ref()
+            .expect("cache should persist compact GT");
+        let s1 = compact.sample(1).unwrap();
+        assert_eq!(CompactGt::allele(s1[0]), Some(1));
+        assert_eq!(CompactGt::allele(s1[1]), Some(1));
+        let bits = q[0]
+            .gt_bits
+            .as_ref()
+            .expect("cache should persist precompiled GT bitset");
+        assert_eq!(bits.allele_for_hap(0, 1), Some(Some(0)));
+        assert_eq!(bits.allele_for_hap(0, 2), Some(Some(1)));
     }
 
     #[test]
@@ -996,6 +1885,28 @@ mod tests {
         assert_eq!(bits.allele_for_hap(1, 1), Some(Some(1)));
         assert_eq!(bits.allele_for_hap(1, 2), Some(Some(0)));
         assert_eq!(store.compile_stats().biallelic_gt_bitset_records, 1);
+    }
+
+    #[test]
+    fn decode_gt_keeps_raw_matrix_only_when_compact_overflows() {
+        let compact_raw = [((1 + 1) << 1) | 1];
+        let compact = decode_gt_stores(2, 1, compact_raw.len() as c_int, compact_raw.as_ptr());
+        assert!(compact.has_gt);
+        assert!(compact.gt.is_empty());
+        assert!(compact.gt_compact.is_some());
+
+        let huge_allele = COMPACT_GT_ALLELE_MASK as i32 + 1;
+        let raw = [(huge_allele + 1) << 1];
+        let fallback = decode_gt_stores(
+            huge_allele as usize + 1,
+            1,
+            raw.len() as c_int,
+            raw.as_ptr(),
+        );
+        assert!(fallback.has_gt);
+        assert!(fallback.gt_compact.is_none());
+        assert_eq!(fallback.gt.len(), 1);
+        assert_eq!(fallback.gt[0][0].allele, Some(huge_allele));
     }
 
     #[test]
@@ -1024,6 +1935,40 @@ mod tests {
         let q0 = store.query("chr1", 6, 12, 0);
         assert_eq!(q0.len(), 1);
         assert_eq!(q0[0].pos, 7);
+    }
+
+    #[test]
+    fn query_set_borrows_hot_path_and_filtered_spanning_prefix() {
+        let vcf = write_vcf(
+            "query_set_shape",
+            "chr1\t5\t.\tGGGGG\tG\t.\t.\t.\tGT\t1|1\t0/1\n\
+             chr1\t8\t.\tC\tT\t.\t.\t.\tGT\t0/1\t1/1\n\
+             chr1\t12\t.\tA\tG\t.\t.\t.\tGT\t0/1\t1/1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+
+        let hot = store.query_set("chr1", 9, 20, 0);
+        match &hot {
+            RecordSet::IndexSlice { idx, .. } => assert_eq!(idx.len(), 1),
+            other => panic!("expected borrowed hot-path slice, got {:?}", other.len()),
+        }
+        assert_eq!(hot.iter().next().unwrap().pos, 11);
+
+        let spanning = store.query_set("chr1", 6, 12, 1);
+        match &spanning {
+            RecordSet::IndexFilteredPrefixAndSlice {
+                prefix_len, idx, ..
+            } => {
+                assert_eq!(*prefix_len, 1);
+                assert_eq!(idx.len(), 2);
+            }
+            other => panic!(
+                "expected filtered spanning prefix + borrowed tail, got {:?}",
+                other.len()
+            ),
+        }
+        let positions: Vec<i64> = spanning.iter().map(|r| r.pos).collect();
+        assert_eq!(positions, vec![4, 7, 11]);
     }
 
     #[test]

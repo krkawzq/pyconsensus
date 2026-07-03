@@ -4,15 +4,15 @@
 //!
 //! Strategy:
 //!   * If `libs/htslib/libhts.a` already exists, reuse it (fast path).
-//!   * Otherwise ensure a htslib checkout exists under `libs/htslib/`:
-//!       - missing  -> `git clone` htslib, then `git checkout <HTSLIB_REF>`,
-//!                     then `git submodule update --init --recursive`.
-//!       - present  -> reuse it; re-init the submodule if needed and, when the
-//!                     working tree is clean, sync HEAD to `<HTSLIB_REF>`.
-//!     The default ref is a tested commit (htslib 1.23.1-64-g9d53dcaa);
-//!     override with the `HTSLIB_REF` env var (any commit/tag/branch). The
-//!     remote can be overridden with `HTSLIB_URL`.
+//!   * Otherwise ensure a htslib checkout exists under `libs/htslib/`. If it
+//!     is missing, clone htslib, check out `<HTSLIB_REF>`, and init the
+//!     submodules. If present, reuse it; re-init the submodule if needed and,
+//!     when the working tree is clean, sync HEAD to `<HTSLIB_REF>`.
 //!   * Then run `autoreconf -i && ./configure ... && make -j libhts.a` once.
+//!
+//! The default ref is a tested commit (htslib 1.23.1-64-g9d53dcaa); override
+//! with the `HTSLIB_REF` env var (any commit/tag/branch). The remote can be
+//! overridden with `HTSLIB_URL`.
 //!
 //! We disable libcurl/s3/gcs/plugins: this tool only reads local files, so the
 //! remote-URL machinery and its curl dependency are unnecessary. That yields a
@@ -126,7 +126,11 @@ fn ensure_submodules(dir: &Path) {
         return;
     }
     eprintln!("[build.rs] initializing htslib submodules (htscodecs)");
-    run(dir, "git", &["submodule", "update", "--init", "--recursive"]);
+    run(
+        dir,
+        "git",
+        &["submodule", "update", "--init", "--recursive"],
+    );
 }
 
 /// Force-checkout `ref_` (used right after a fresh clone).
@@ -192,7 +196,7 @@ fn build_htslib(dir: &Path) {
 
     let nproc = env::var("CARGO_BUILD_JOBS")
         .ok()
-        .or_else(|| num_cpus_hint())
+        .or_else(num_cpus_hint)
         .unwrap_or_else(|| "4".to_string());
 
     run(dir, "autoreconf", &["-i"]);
@@ -263,7 +267,11 @@ fn run(dir: &Path, program: &str, args: &[&str]) {
 
 /// Run a git subcommand and return its stdout, or `None` on failure.
 fn git_output_opt(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

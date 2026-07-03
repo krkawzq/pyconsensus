@@ -1,12 +1,12 @@
-//! mask — `-m FILE` + `--mask-with CHAR|uc|lc`.
+//! mask — compiled interval store for `-m FILE` + `--mask-with CHAR|uc|lc`.
 //!
-//! Ports `mask_region` (consensus.c:1063) and the per-variant mask check
-//! (consensus.c:590-600). Mask regions are loaded into an htslib regidx; at
-//! apply time, variants overlapping a char-mode mask are skipped, and at the
-//! end of the region the masked spans are overwritten per `--mask-with`.
+//! The hot path keeps BED intervals in Rust-owned vectors keyed by contig. This
+//! avoids per-region htslib regidx iterators, CString creation, and mutable FFI
+//! iterator state.
 
-use crate::htslib_ffi as ffi;
-use std::ffi::CString;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 /// `--mask-with` mode. Char-mode also causes variant skipping (MASK_SKIP).
@@ -33,35 +33,79 @@ impl MaskWith {
     }
 }
 
-/// One mask file + its mode. Not Send (regidx/regitr carry state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Interval {
+    beg: i64,
+    end: i64,
+}
+
+/// One compiled mask file + replacement mode.
 pub struct Mask {
-    idx: *mut ffi::regidx_t,
-    itr: *mut ffi::regitr_t,
+    by_chr: HashMap<String, Vec<Interval>>,
     pub with: MaskWith,
     path: PathBuf,
 }
 
 impl Mask {
-    /// Load a mask BED file with the given replacement mode.
+    /// Load a BED-like mask file. Coordinates are BED 0-based half-open
+    /// `[start,end)` and are stored internally as inclusive intervals.
     pub fn load(path: impl Into<PathBuf>, with: MaskWith) -> Result<Self, String> {
         let path = path.into();
-        let c = CString::new(path.to_str().ok_or("non-UTF8 mask path")?)
-            .map_err(|_| "non-NUL mask path".to_string())?;
-        let idx = unsafe { ffi::regidx_init(c.as_ptr(), None, None, 0, std::ptr::null_mut()) };
-        if idx.is_null() {
-            return Err(format!("regidx_init failed for {}", path.display()));
+        let f = File::open(&path).map_err(|e| format!("open mask {}: {}", path.display(), e))?;
+        let mut by_chr: HashMap<String, Vec<Interval>> = HashMap::new();
+        for (line_no, line) in BufReader::new(f).lines().enumerate() {
+            let line = line.map_err(|e| format!("read mask {}: {}", path.display(), e))?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let chr = match fields.next() {
+                Some(chr) => chr,
+                None => continue,
+            };
+            let beg: i64 = fields
+                .next()
+                .ok_or_else(|| format!("mask {}:{} missing start", path.display(), line_no + 1))?
+                .parse()
+                .map_err(|_| format!("mask {}:{} invalid start", path.display(), line_no + 1))?;
+            let end_excl: i64 = fields
+                .next()
+                .ok_or_else(|| format!("mask {}:{} missing end", path.display(), line_no + 1))?
+                .parse()
+                .map_err(|_| format!("mask {}:{} invalid end", path.display(), line_no + 1))?;
+            if beg < 0 || end_excl < beg {
+                return Err(format!(
+                    "mask {}:{} invalid interval",
+                    path.display(),
+                    line_no + 1
+                ));
+            }
+            if end_excl == beg {
+                continue;
+            }
+            by_chr.entry(chr.to_string()).or_default().push(Interval {
+                beg,
+                end: end_excl - 1,
+            });
         }
-        let itr = unsafe { ffi::regitr_init(idx) };
-        if itr.is_null() {
-            unsafe { ffi::regidx_destroy(idx) };
-            return Err("regitr_init failed".to_string());
+        for intervals in by_chr.values_mut() {
+            intervals.sort_by_key(|iv| (iv.beg, iv.end));
+            let mut merged: Vec<Interval> = Vec::with_capacity(intervals.len());
+            for iv in intervals.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if iv.beg <= last.end + 1 {
+                        if iv.end > last.end {
+                            last.end = iv.end;
+                        }
+                        continue;
+                    }
+                }
+                merged.push(iv);
+            }
+            *intervals = merged;
         }
-        Ok(Mask {
-            idx,
-            itr,
-            with,
-            path,
-        })
+        Ok(Mask { by_chr, with, path })
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -69,86 +113,99 @@ impl Mask {
     }
 
     /// Does any mask region overlap `[start, end]` (0-based, inclusive)?
-    /// Used by apply_variant's MASK_SKIP check (consensus.c:590-600).
     pub fn overlaps(&self, chr: &str, start: i64, end: i64) -> bool {
-        let c = match CString::new(chr) {
-            Ok(c) => c,
-            Err(_) => return false,
+        if end < start {
+            return false;
+        }
+        let Some(intervals) = self.by_chr.get(chr) else {
+            return false;
         };
-        unsafe { ffi::regidx_overlap(self.idx, c.as_ptr(), start, end, self.itr) != 0 }
+        let first_after_end = intervals.partition_point(|iv| iv.beg <= end);
+        if first_after_end == 0 {
+            return false;
+        }
+        intervals[first_after_end - 1].end >= start
     }
 
     /// Apply the mask to `buf`, which spans `[ori_pos, ori_pos+len-1]`
-    /// (0-based). Mirrors `mask_region` (consensus.c:1063): for each mask
-    /// region overlapping the buffer, replace the overlapping span per `with`.
+    /// (0-based, inclusive).
     pub fn apply_to_buf(&self, chr: &str, buf: &mut [u8], ori_pos: i64) {
         if buf.is_empty() {
             return;
         }
+        let Some(intervals) = self.by_chr.get(chr) else {
+            return;
+        };
         let len = buf.len() as i64;
-        // bcftools: start = fa_src_pos - len; end = fa_src_pos, where fa_src_pos
-        // is the (0-based) position just past the buffer end. With our whole-
-        // region buffer, fa_src_pos = ori_pos + len, so [start,end] = [ori_pos, ori_pos+len-1].
         let start = ori_pos;
         let end = ori_pos + len - 1;
-        let c = match CString::new(chr) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        unsafe {
-            if ffi::regidx_overlap(self.idx, c.as_ptr(), start, end, self.itr) == 0 {
-                return;
+        let mut i = intervals.partition_point(|iv| iv.end < start);
+        while i < intervals.len() {
+            let iv = intervals[i];
+            if iv.beg > end {
+                break;
             }
-            while ffi::regitr_overlap(self.itr) != 0 {
-                let mbeg = (*self.itr).beg;
-                let mend = (*self.itr).end;
-                // map to buffer indices
-                let mut idx_start = mbeg - start;
-                let mut idx_end = mend - start;
-                if idx_start < 0 {
-                    idx_start = 0;
-                }
-                if idx_end >= len {
-                    idx_end = len - 1;
-                }
-                if idx_end < idx_start {
-                    continue;
-                }
-                let (s, e) = (idx_start as usize, idx_end as usize);
-                match self.with {
-                    MaskWith::Char(ch) => {
-                        for b in &mut buf[s..=e] {
-                            *b = ch;
-                        }
+            let s = (iv.beg.max(start) - start) as usize;
+            let e = (iv.end.min(end) - start) as usize;
+            match self.with {
+                MaskWith::Char(ch) => buf[s..=e].fill(ch),
+                MaskWith::Uc => {
+                    for b in &mut buf[s..=e] {
+                        *b = b.to_ascii_uppercase();
                     }
-                    MaskWith::Uc => {
-                        for b in &mut buf[s..=e] {
-                            *b = b.to_ascii_uppercase();
-                        }
-                    }
-                    MaskWith::Lc => {
-                        for b in &mut buf[s..=e] {
-                            *b = b.to_ascii_lowercase();
-                        }
+                }
+                MaskWith::Lc => {
+                    for b in &mut buf[s..=e] {
+                        *b = b.to_ascii_lowercase();
                     }
                 }
             }
+            i += 1;
         }
     }
 }
 
-impl Drop for Mask {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.itr.is_null() {
-                ffi::regitr_destroy(self.itr);
-            }
-            if !self.idx.is_null() {
-                ffi::regidx_destroy(self.idx);
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_mask(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_mask_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mask.bed");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn compiled_mask_overlaps_and_applies_bed_intervals() {
+        let path = write_mask("basic", "# comment\nchr1\t2\t5\nchr1\t5\t7\nchr1\t10\t12\n");
+        let mask = Mask::load(&path, MaskWith::Char(b'N')).unwrap();
+
+        assert!(mask.overlaps("chr1", 1, 2));
+        assert!(mask.overlaps("chr1", 6, 6));
+        assert!(!mask.overlaps("chr1", 7, 9));
+        assert!(!mask.overlaps("chr2", 2, 4));
+
+        let mut buf = b"abcdefghijklmn".to_vec();
+        mask.apply_to_buf("chr1", &mut buf, 0);
+        assert_eq!(buf, b"abNNNNNhijNNmn");
+    }
+
+    #[test]
+    fn compiled_mask_case_modes() {
+        let path = write_mask("case", "chr1\t1\t4\n");
+        let mut buf = b"aCgTa".to_vec();
+        Mask::load(&path, MaskWith::Uc)
+            .unwrap()
+            .apply_to_buf("chr1", &mut buf, 0);
+        assert_eq!(buf, b"aCGTa");
+
+        let mut buf = b"aCgTa".to_vec();
+        Mask::load(&path, MaskWith::Lc)
+            .unwrap()
+            .apply_to_buf("chr1", &mut buf, 0);
+        assert_eq!(buf, b"acgta");
     }
 }
-
-// regidx/regitr carry internal state; not shared across threads unsynchronised.
-unsafe impl Send for Mask {}

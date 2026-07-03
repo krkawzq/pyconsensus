@@ -15,14 +15,17 @@
 //! missing hooks are present but inert until M4 wires real options.
 
 use crate::chain::Chain;
-use crate::compiled::AlleleOpKind;
+use crate::compiled::{
+    allele_case_flags, AlleleOpKind, RecordKind, ALLELE_HAS_ASCII_LOWER, ALLELE_HAS_ASCII_UPPER,
+};
 use crate::haplotype::{select_allele, AlleleSelection, SampleMode};
 use crate::mask::Mask;
-use crate::planner::{plan_region, PlanOptions, RegionPlan};
+use crate::planner::{plan_region_set, PlanOptions, RegionPlan};
 use crate::stats::{FallbackReason, FastPathLane, RuntimeStats};
-use crate::vcf_store::VcfRecord;
+use crate::vcf_store::{RecordSet, VcfRecord};
 use smallvec::SmallVec;
-use std::rc::Rc;
+use std::borrow::Cow;
+use std::sync::Arc;
 
 type AlleleBuf = SmallVec<[u8; 64]>;
 
@@ -44,10 +47,8 @@ pub struct ApplyOptions {
     pub mark_snv: Option<u8>,
     /// How to pick the allele per record. Defaults to ApplyAllAlt (no `-s`, no `-I`).
     pub sample_mode: SampleMode,
-    /// `-m` mask (char-mode skips overlapping variants). Rc lets a region group
-    /// reuse one mask instance sequentially without sharing htslib iterator
-    /// state across threads.
-    pub mask: Option<Rc<Mask>>,
+    /// `-m` mask (char-mode skips overlapping variants).
+    pub mask: Option<Arc<Mask>>,
 }
 
 impl ApplyOptions {
@@ -116,7 +117,8 @@ pub fn apply_region(
     opts: &ApplyOptions,
     chain: Option<&mut Chain>,
 ) -> ApplyState {
-    apply_region_planned(chr, ref_seq, ori_pos, records, opts, chain, None)
+    let records = RecordSet::from_ref_slice(records);
+    apply_region_planned_set(chr, ref_seq, ori_pos, &records, opts, chain, None)
 }
 
 pub fn apply_region_planned(
@@ -128,38 +130,62 @@ pub fn apply_region_planned(
     chain: Option<&mut Chain>,
     plan: Option<&RegionPlan>,
 ) -> ApplyState {
+    let records = RecordSet::from_ref_slice(records);
+    apply_region_planned_set(chr, ref_seq, ori_pos, &records, opts, chain, plan)
+}
+
+pub fn apply_region_planned_set(
+    chr: &str,
+    ref_seq: Vec<u8>,
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+    opts: &ApplyOptions,
+    chain: Option<&mut Chain>,
+    plan: Option<&RegionPlan>,
+) -> ApplyState {
     if records.is_empty() {
         return apply_empty_region(chr, ref_seq, ori_pos, opts);
     }
 
-    if chain.is_none() {
-        match plan.map(|p| p.lane) {
-            Some(FastPathLane::SameLenOnly) => {
-                if let Some(state) =
-                    try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
-                {
-                    return state;
-                }
+    let mut chain_opt = chain;
+    match plan.map(|p| p.lane) {
+        Some(FastPathLane::SameLenOnly) => {
+            if let Some(state) =
+                try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, plan)
+            {
+                return state;
             }
-            Some(FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits) => {
-                if let Some((state, _lane)) =
-                    try_apply_edit_script_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
-                {
-                    return state;
-                }
+        }
+        Some(FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits) => {
+            if let Some((state, _lane)) = try_apply_edit_script_region(
+                chr,
+                ref_seq.as_slice(),
+                ori_pos,
+                records,
+                opts,
+                plan,
+                chain_opt.as_deref_mut(),
+            ) {
+                return state;
             }
-            Some(FastPathLane::FallbackStateMachine) => {}
-            _ => {
-                if let Some(state) =
-                    try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
-                {
-                    return state;
-                }
-                if let Some((state, _lane)) =
-                    try_apply_edit_script_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
-                {
-                    return state;
-                }
+        }
+        Some(FastPathLane::FallbackStateMachine) => {}
+        _ => {
+            if let Some(state) =
+                try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, plan)
+            {
+                return state;
+            }
+            if let Some((state, _lane)) = try_apply_edit_script_region(
+                chr,
+                ref_seq.as_slice(),
+                ori_pos,
+                records,
+                opts,
+                plan,
+                chain_opt.as_deref_mut(),
+            ) {
+                return state;
             }
         }
     }
@@ -177,9 +203,7 @@ pub fn apply_region_planned(
     if let Some(mask) = &opts.mask {
         mask.apply_to_buf(chr, &mut state.buf, state.ori_pos);
     }
-    // hand the chain to apply_variant via a temporary Option<&mut> we can reborrow
-    let mut chain_opt = chain;
-    for rec in records {
+    for rec in records.iter() {
         let ch = chain_opt.as_deref_mut();
         apply_variant(rec, &mut state, opts, ch);
     }
@@ -198,8 +222,20 @@ pub fn apply_region_with_stats(
     opts: &ApplyOptions,
     stats: &mut RuntimeStats,
 ) -> ApplyState {
+    let records = RecordSet::from_ref_slice(records);
+    apply_region_with_stats_set(chr, ref_seq, ori_pos, &records, opts, stats)
+}
+
+pub fn apply_region_with_stats_set(
+    chr: &str,
+    ref_seq: Vec<u8>,
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+    opts: &ApplyOptions,
+    stats: &mut RuntimeStats,
+) -> ApplyState {
     stats.observe_region();
-    for _ in records {
+    for _ in 0..records.len() {
         stats.observe_record();
     }
 
@@ -208,7 +244,8 @@ pub fn apply_region_with_stats(
         return apply_empty_region(chr, ref_seq, ori_pos, opts);
     }
 
-    if let Some(state) = try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
+    if let Some(state) =
+        try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, None)
     {
         stats.observe_lane(FastPathLane::SameLenOnly);
         for _ in 0..state.napplied {
@@ -218,7 +255,7 @@ pub fn apply_region_with_stats(
     }
 
     if let Some((state, lane)) =
-        try_apply_edit_script_region(chr, ref_seq.as_slice(), ori_pos, records, opts)
+        try_apply_edit_script_region(chr, ref_seq.as_slice(), ori_pos, records, opts, None, None)
     {
         stats.observe_lane(lane);
         for _ in 0..state.napplied {
@@ -233,9 +270,14 @@ pub fn apply_region_with_stats(
         mark_ins: opts.mark_ins.is_some(),
         mark_snv: opts.mark_snv.is_some(),
         mask: opts.mask.is_some(),
+        mask_skips_variants: opts
+            .mask
+            .as_ref()
+            .is_some_and(|mask| mask.with.skips_variants()),
+        mask_overlaps_variant: mask_overlaps_records(chr, records, opts),
         absent: opts.absent_allele.is_some(),
     };
-    let plan = plan_region(records, plan_opts);
+    let plan = plan_region_set(records, plan_opts);
     stats.observe_lane(FastPathLane::FallbackStateMachine);
     stats.observe_fallback_records(records.len() as u64);
     if plan.fallback_reasons.is_empty() {
@@ -245,7 +287,7 @@ pub fn apply_region_with_stats(
             stats.observe_fallback_reason(reason);
         }
     }
-    apply_region(chr, ref_seq, ori_pos, records, opts, None)
+    apply_region_planned_set(chr, ref_seq, ori_pos, records, opts, None, None)
 }
 
 fn apply_empty_region(
@@ -264,16 +306,9 @@ fn apply_empty_region(
     state
 }
 
-struct SameLenPatch {
-    idx: usize,
-    pos: i64,
-    rlen: usize,
-    alt: AlleleBuf,
-    count_applied: bool,
-}
-
 enum FastSelection {
     Skip,
+    Missing,
     Allele {
         ialt: usize,
         alt_override: Option<AlleleBuf>,
@@ -296,24 +331,87 @@ fn select_fastpath_allele(rec: &VcfRecord, opts: &ApplyOptions) -> Option<FastSe
             ialt: i as usize,
             alt_override: selection.alt_override,
         }),
-        Some(_) => None,
+        Some(_) => Some(FastSelection::Missing),
     }
+}
+
+fn repeated_allele_byte(len: usize, byte: u8) -> AlleleBuf {
+    let mut out = AlleleBuf::new();
+    out.resize(len, byte);
+    out
+}
+
+#[inline]
+fn mask_overlaps_records(chr: &str, records: &RecordSet<'_>, opts: &ApplyOptions) -> bool {
+    let Some(mask) = &opts.mask else {
+        return false;
+    };
+    if !mask.with.skips_variants() {
+        return false;
+    }
+    records
+        .iter()
+        .any(|rec| mask.overlaps(chr, rec.pos, rec.ref_end()))
+}
+
+#[inline]
+fn mask_allows_variant_fastpath(
+    chr: &str,
+    records: &RecordSet<'_>,
+    opts: &ApplyOptions,
+    plan: Option<&RegionPlan>,
+) -> bool {
+    if let Some(plan) = plan {
+        if plan.mask_overlap_known {
+            return !plan.mask_overlaps_variant;
+        }
+    }
+    !mask_overlaps_records(chr, records, opts)
+}
+
+fn fastpath_ref_seq<'a>(
+    chr: &str,
+    ref_seq: &'a [u8],
+    ori_pos: i64,
+    opts: &ApplyOptions,
+) -> Cow<'a, [u8]> {
+    let Some(mask) = &opts.mask else {
+        return Cow::Borrowed(ref_seq);
+    };
+    if ref_seq.is_empty() || !mask.overlaps(chr, ori_pos, ori_pos + ref_seq.len() as i64 - 1) {
+        return Cow::Borrowed(ref_seq);
+    }
+    let mut masked = ref_seq.to_vec();
+    mask.apply_to_buf(chr, &mut masked, ori_pos);
+    Cow::Owned(masked)
 }
 
 fn try_apply_same_len_region(
     chr: &str,
     ref_seq: &[u8],
     ori_pos: i64,
-    records: &[&VcfRecord],
+    records: &RecordSet<'_>,
     opts: &ApplyOptions,
+    plan: Option<&RegionPlan>,
 ) -> Option<ApplyState> {
-    if records.is_empty() || opts.missing_allele.is_some() || opts.mask.is_some() {
+    if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
         return None;
     }
+    if is_plain_apply_all_alt(opts) {
+        if let Some(state) = try_apply_snp1_plain_apply_all_alt(chr, ref_seq, ori_pos, records) {
+            return Some(state);
+        }
+        if let Some(state) = try_apply_same_len_plain_apply_all_alt(chr, ref_seq, ori_pos, records)
+        {
+            return Some(state);
+        }
+    }
+    let base_ref = fastpath_ref_seq(chr, ref_seq, ori_pos, opts);
+    let base_ref = base_ref.as_ref();
 
-    let mut patches: Vec<SameLenPatch> = Vec::with_capacity(records.len());
+    let mut patches: Vec<SameLenRegionPatch<'_>> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
-    for rec in records {
+    for rec in records.iter() {
         if rec.alleles.len() == 1 {
             if opts.absent_allele.is_none() {
                 continue;
@@ -327,17 +425,24 @@ fn try_apply_same_len_region(
                 return None;
             }
             let idx = idx as usize;
-            if idx + rlen > ref_seq.len() || rec.alleles[0].len() != rlen {
+            if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
                 return None;
             }
-            if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
                 return None;
             }
-            patches.push(SameLenPatch {
+            patches.push(SameLenRegionPatch::Allele {
                 idx,
                 pos: rec.pos,
                 rlen,
-                alt: SmallVec::from_slice(&rec.alleles[0]),
+                alt: SameLenPatchAlt::Borrowed {
+                    bases: &rec.alleles[0],
+                    case_flags: rec
+                        .compiled
+                        .allele_op(0)
+                        .map(|op| op.case_flags)
+                        .unwrap_or_else(|| allele_case_flags(&rec.alleles[0])),
+                },
                 count_applied: false,
             });
             frz_pos = rec.ref_end();
@@ -346,11 +451,179 @@ fn try_apply_same_len_region(
         if rec.pos <= frz_pos {
             return None;
         }
-        let (ialt, alt_override) = match select_fastpath_allele(rec, opts)? {
+        let selection = select_fastpath_allele(rec, opts)?;
+        let (is_missing, ialt, alt_override) = match selection {
             FastSelection::Skip => continue,
-            FastSelection::Allele { ialt, alt_override } => (ialt, alt_override),
+            FastSelection::Missing => (true, usize::MAX, None),
+            FastSelection::Allele { ialt, alt_override } => (false, ialt, alt_override),
         };
-        if ialt >= rec.alleles.len() || rec.rlen <= 0 {
+        if rec.rlen <= 0 {
+            return None;
+        }
+        let rlen = rec.rlen as usize;
+        let idx = rec.pos - ori_pos;
+        if idx < 0 {
+            return None;
+        }
+        let idx = idx as usize;
+        if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
+            return None;
+        }
+        if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+            return None;
+        }
+
+        if is_missing {
+            let missing = opts.missing_allele?;
+            patches.push(SameLenRegionPatch::Missing {
+                idx,
+                pos: rec.pos,
+                rlen,
+                missing,
+            });
+        } else {
+            if ialt >= rec.alleles.len() {
+                return None;
+            }
+            match alt_override {
+                Some(alt) if alt.len() == rlen => {
+                    let case_flags = allele_case_flags(&alt);
+                    patches.push(SameLenRegionPatch::Allele {
+                        idx,
+                        pos: rec.pos,
+                        rlen,
+                        alt: SameLenPatchAlt::Owned {
+                            bases: alt,
+                            case_flags,
+                        },
+                        count_applied: true,
+                    });
+                }
+                Some(_) => return None,
+                None if rec.compiled.same_len_allele(ialt) => {
+                    patches.push(SameLenRegionPatch::Allele {
+                        idx,
+                        pos: rec.pos,
+                        rlen,
+                        alt: SameLenPatchAlt::Borrowed {
+                            bases: &rec.alleles[ialt],
+                            case_flags: rec
+                                .compiled
+                                .allele_op(ialt)
+                                .map(|op| op.case_flags)
+                                .unwrap_or_else(|| allele_case_flags(&rec.alleles[ialt])),
+                        },
+                        count_applied: true,
+                    });
+                }
+                None => return None,
+            }
+        };
+        frz_pos = rec.ref_end();
+    }
+
+    if patches.is_empty() {
+        if let Some(absent) = opts.absent_allele {
+            return Some(ApplyState::new(ori_pos, vec![absent; base_ref.len()]).with_chr(chr));
+        }
+        return None;
+    }
+
+    let initial = match opts.absent_allele {
+        Some(absent) => vec![absent; base_ref.len()],
+        None => base_ref.to_vec(),
+    };
+    let mut state = ApplyState::new(ori_pos, initial).with_chr(chr);
+    for patch in &patches {
+        match patch {
+            SameLenRegionPatch::Allele {
+                idx,
+                pos,
+                rlen,
+                alt,
+                count_applied,
+            } => {
+                let (bases, case_flags) = alt.parts();
+                apply_same_len_patch(
+                    &mut state,
+                    base_ref,
+                    *idx,
+                    *pos,
+                    *rlen,
+                    bases,
+                    case_flags,
+                    *count_applied,
+                    opts.mark_snv,
+                );
+            }
+            SameLenRegionPatch::Missing {
+                idx,
+                pos,
+                rlen,
+                missing,
+            } => apply_same_len_missing_patch(
+                &mut state, base_ref, *idx, *pos, *rlen, *missing, true,
+            ),
+        }
+    }
+    Some(state)
+}
+
+enum SameLenPatchAlt<'a> {
+    Borrowed { bases: &'a [u8], case_flags: u8 },
+    Owned { bases: AlleleBuf, case_flags: u8 },
+}
+
+impl SameLenPatchAlt<'_> {
+    #[inline]
+    fn parts(&self) -> (&[u8], u8) {
+        match self {
+            SameLenPatchAlt::Borrowed { bases, case_flags } => (bases, *case_flags),
+            SameLenPatchAlt::Owned { bases, case_flags } => (bases.as_slice(), *case_flags),
+        }
+    }
+}
+
+enum SameLenRegionPatch<'a> {
+    Allele {
+        idx: usize,
+        pos: i64,
+        rlen: usize,
+        alt: SameLenPatchAlt<'a>,
+        count_applied: bool,
+    },
+    Missing {
+        idx: usize,
+        pos: i64,
+        rlen: usize,
+        missing: u8,
+    },
+}
+
+#[inline]
+fn is_plain_apply_all_alt(opts: &ApplyOptions) -> bool {
+    matches!(opts.sample_mode, SampleMode::ApplyAllAlt)
+        && opts.absent_allele.is_none()
+        && opts.missing_allele.is_none()
+        && opts.mark_del.is_none()
+        && opts.mark_ins.is_none()
+        && opts.mark_snv.is_none()
+        && opts.mask.is_none()
+}
+
+fn try_apply_same_len_plain_apply_all_alt(
+    chr: &str,
+    ref_seq: &[u8],
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+) -> Option<ApplyState> {
+    let mut patches: Vec<SameLenPlainPatch<'_>> = Vec::with_capacity(records.len());
+    let mut frz_pos = -1i64;
+    for rec in records.iter() {
+        if rec.alleles.len() == 1 {
+            continue;
+        }
+        if rec.pos <= frz_pos || rec.rlen <= 0 || !rec.compiled.same_len_allele(1) {
             return None;
         }
         let rlen = rec.rlen as usize;
@@ -365,65 +638,211 @@ fn try_apply_same_len_region(
         if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
             return None;
         }
-
-        let alt = match alt_override {
-            Some(alt) if alt.len() == rlen => alt,
-            Some(_) => return None,
-            None if rec.compiled.same_len_allele(ialt) => SmallVec::from_slice(&rec.alleles[ialt]),
-            None => return None,
-        };
-        patches.push(SameLenPatch {
+        let alt = &rec.alleles[1];
+        if alt.len() != rlen {
+            return None;
+        }
+        let case_flags = rec
+            .compiled
+            .allele_op(1)
+            .map(|op| op.case_flags)
+            .unwrap_or_else(|| allele_case_flags(alt));
+        patches.push(SameLenPlainPatch {
             idx,
             pos: rec.pos,
             rlen,
             alt,
-            count_applied: true,
+            case_flags,
         });
         frz_pos = rec.ref_end();
     }
 
     if patches.is_empty() {
-        if let Some(absent) = opts.absent_allele {
-            return Some(ApplyState::new(ori_pos, vec![absent; ref_seq.len()]).with_chr(chr));
-        }
         return None;
     }
-
-    let initial = match opts.absent_allele {
-        Some(absent) => vec![absent; ref_seq.len()],
-        None => ref_seq.to_vec(),
-    };
-    let mut state = ApplyState::new(ori_pos, initial).with_chr(chr);
+    let mut state = ApplyState::new(ori_pos, ref_seq.to_vec()).with_chr(chr);
     for patch in patches {
-        let first_base = ref_seq[patch.idx];
-        let last_base = ref_seq[patch.idx + patch.rlen - 1];
-        let to_upper = first_base.is_ascii_uppercase();
-        state.case = if to_upper { TO_UPPER } else { TO_LOWER };
-        copy_alt_with_case(
-            &mut state.buf[patch.idx..patch.idx + patch.rlen],
-            &patch.alt,
-            to_upper,
+        apply_same_len_plain_patch(
+            &mut state,
+            ref_seq,
+            patch.idx,
+            patch.pos,
+            patch.rlen,
+            patch.alt,
+            patch.case_flags,
         );
-        if let Some(mark) = opts.mark_snv {
-            mark_snv_bytes(
-                &ref_seq[patch.idx..patch.idx + patch.rlen],
-                0,
-                &mut state.buf[patch.idx..patch.idx + patch.rlen],
-                0,
-                patch.rlen as i64,
-                mark,
-            );
-        }
-        state.prev_base = last_base;
-        state.prev_base_pos = patch.pos + patch.rlen as i64 - 1;
-        state.prev_is_insert = false;
-        state.frz_mod = patch.idx as i64 + patch.rlen as i64;
-        state.frz_pos = patch.pos + patch.rlen as i64 - 1;
-        if patch.count_applied {
-            state.napplied += 1;
-        }
     }
     Some(state)
+}
+
+fn try_apply_snp1_plain_apply_all_alt(
+    chr: &str,
+    ref_seq: &[u8],
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+) -> Option<ApplyState> {
+    let mut patches: Vec<Snp1PlainPatch> = Vec::with_capacity(records.len());
+    let mut frz_pos = -1i64;
+    for rec in records.iter() {
+        if rec.alleles.len() == 1 {
+            continue;
+        }
+        if rec.pos <= frz_pos || rec.rlen != 1 || rec.compiled.kind != RecordKind::Snp1 {
+            return None;
+        }
+        let idx = rec.pos - ori_pos;
+        if idx < 0 {
+            return None;
+        }
+        let idx = idx as usize;
+        if idx >= ref_seq.len() || rec.alleles[0].len() != 1 || rec.alleles[1].len() != 1 {
+            return None;
+        }
+        if !ascii_eq_ignore_case(ref_seq[idx], rec.alleles[0][0]) {
+            return None;
+        }
+        patches.push(Snp1PlainPatch {
+            idx,
+            pos: rec.pos,
+            alt: rec.alleles[1][0],
+        });
+        frz_pos = rec.pos;
+    }
+
+    if patches.is_empty() {
+        return None;
+    }
+    let mut state = ApplyState::new(ori_pos, ref_seq.to_vec()).with_chr(chr);
+    for patch in patches {
+        apply_snp1_plain_patch(&mut state, ref_seq, patch.idx, patch.pos, patch.alt);
+    }
+    Some(state)
+}
+
+struct SameLenPlainPatch<'a> {
+    idx: usize,
+    pos: i64,
+    rlen: usize,
+    alt: &'a [u8],
+    case_flags: u8,
+}
+
+struct Snp1PlainPatch {
+    idx: usize,
+    pos: i64,
+    alt: u8,
+}
+
+#[inline]
+fn apply_snp1_plain_patch(state: &mut ApplyState, ref_seq: &[u8], idx: usize, pos: i64, alt: u8) {
+    let ref_base = ref_seq[idx];
+    let to_upper = ref_base.is_ascii_uppercase();
+    state.case = if to_upper { TO_UPPER } else { TO_LOWER };
+    state.buf[idx] = if to_upper && alt.is_ascii_lowercase() {
+        alt.to_ascii_uppercase()
+    } else if !to_upper && alt.is_ascii_uppercase() {
+        alt.to_ascii_lowercase()
+    } else {
+        alt
+    };
+    state.prev_base = ref_base;
+    state.prev_base_pos = pos;
+    state.prev_is_insert = false;
+    state.frz_mod = idx as i64 + 1;
+    state.frz_pos = pos;
+    state.napplied += 1;
+}
+
+#[inline]
+fn apply_same_len_plain_patch(
+    state: &mut ApplyState,
+    ref_seq: &[u8],
+    idx: usize,
+    pos: i64,
+    rlen: usize,
+    alt: &[u8],
+    case_flags: u8,
+) {
+    let first_base = ref_seq[idx];
+    let last_base = ref_seq[idx + rlen - 1];
+    let to_upper = first_base.is_ascii_uppercase();
+    state.case = if to_upper { TO_UPPER } else { TO_LOWER };
+    if rlen == 1 && alt.len() == 1 {
+        state.buf[idx] = alt_byte_with_case_flags(alt[0], to_upper, case_flags);
+    } else {
+        let dst = &mut state.buf[idx..idx + rlen];
+        copy_alt_with_case_flags(dst, alt, to_upper, case_flags);
+    }
+    state.prev_base = last_base;
+    state.prev_base_pos = pos + rlen as i64 - 1;
+    state.prev_is_insert = false;
+    state.frz_mod = idx as i64 + rlen as i64;
+    state.frz_pos = pos + rlen as i64 - 1;
+    state.napplied += 1;
+}
+
+#[inline]
+fn apply_same_len_patch(
+    state: &mut ApplyState,
+    base_ref: &[u8],
+    idx: usize,
+    pos: i64,
+    rlen: usize,
+    alt: &[u8],
+    case_flags: u8,
+    count_applied: bool,
+    mark_snv: Option<u8>,
+) {
+    let first_base = base_ref[idx];
+    let last_base = base_ref[idx + rlen - 1];
+    let to_upper = first_base.is_ascii_uppercase();
+    state.case = if to_upper { TO_UPPER } else { TO_LOWER };
+    if rlen == 1 && alt.len() == 1 {
+        state.buf[idx] =
+            snp1_alt_with_case_flags_and_mark(first_base, alt[0], to_upper, case_flags, mark_snv);
+    } else {
+        let dst = &mut state.buf[idx..idx + rlen];
+        copy_alt_with_case_flags(dst, alt, to_upper, case_flags);
+        if let Some(mark) = mark_snv {
+            mark_snv_bytes(&base_ref[idx..idx + rlen], 0, dst, 0, rlen as i64, mark);
+        }
+    }
+    state.prev_base = last_base;
+    state.prev_base_pos = pos + rlen as i64 - 1;
+    state.prev_is_insert = false;
+    state.frz_mod = idx as i64 + rlen as i64;
+    state.frz_pos = pos + rlen as i64 - 1;
+    if count_applied {
+        state.napplied += 1;
+    }
+}
+
+#[inline]
+fn apply_same_len_missing_patch(
+    state: &mut ApplyState,
+    base_ref: &[u8],
+    idx: usize,
+    pos: i64,
+    rlen: usize,
+    missing: u8,
+    count_applied: bool,
+) {
+    let first_base = base_ref[idx];
+    let last_base = base_ref[idx + rlen - 1];
+    state.case = if first_base.is_ascii_uppercase() {
+        TO_UPPER
+    } else {
+        TO_LOWER
+    };
+    state.buf[idx..idx + rlen].fill(missing);
+    state.prev_base = last_base;
+    state.prev_base_pos = pos + rlen as i64 - 1;
+    state.prev_is_insert = false;
+    state.frz_mod = idx as i64 + rlen as i64;
+    state.frz_pos = pos + rlen as i64 - 1;
+    if count_applied {
+        state.napplied += 1;
+    }
 }
 
 struct EditScriptPatch {
@@ -431,6 +850,7 @@ struct EditScriptPatch {
     pos: i64,
     rlen: usize,
     len_diff: i64,
+    ref_allele: AlleleBuf,
     alt: AlleleBuf,
     count_applied: bool,
 }
@@ -439,12 +859,23 @@ fn try_apply_edit_script_region(
     chr: &str,
     ref_seq: &[u8],
     ori_pos: i64,
-    records: &[&VcfRecord],
+    records: &RecordSet<'_>,
     opts: &ApplyOptions,
+    plan: Option<&RegionPlan>,
+    chain: Option<&mut Chain>,
 ) -> Option<(ApplyState, FastPathLane)> {
-    if records.is_empty() || opts.missing_allele.is_some() || opts.mask.is_some() {
+    if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
         return None;
     }
+    if chain.is_none() && is_plain_apply_all_alt(opts) {
+        if let Some(state_and_lane) =
+            try_apply_edit_script_plain_apply_all_alt(chr, ref_seq, ori_pos, records)
+        {
+            return Some(state_and_lane);
+        }
+    }
+    let base_ref = fastpath_ref_seq(chr, ref_seq, ori_pos, opts);
+    let base_ref = base_ref.as_ref();
 
     let mut patches: Vec<EditScriptPatch> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
@@ -452,7 +883,7 @@ fn try_apply_edit_script_region(
     let mut saw_same_len = false;
     let mut saw_len_change = false;
 
-    for rec in records {
+    for rec in records.iter() {
         if rec.alleles.len() == 1 {
             if opts.absent_allele.is_none() {
                 continue;
@@ -466,13 +897,13 @@ fn try_apply_edit_script_region(
                 return None;
             }
             let idx = idx as usize;
-            if idx + rlen > ref_seq.len() || rec.alleles[0].len() != rlen {
+            if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
                 return None;
             }
-            if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
                 return None;
             }
-            let to_upper = ref_seq[idx].is_ascii_uppercase();
+            let to_upper = base_ref[idx].is_ascii_uppercase();
             let mut alt = SmallVec::from_slice(&rec.alleles[0]);
             apply_case_to_alt(&mut alt, to_upper);
             if let Some(mark) = opts.mark_snv {
@@ -484,6 +915,7 @@ fn try_apply_edit_script_region(
                 pos: rec.pos,
                 rlen,
                 len_diff: 0,
+                ref_allele: SmallVec::from_slice(&rec.alleles[0]),
                 alt,
                 count_applied: false,
             });
@@ -495,24 +927,19 @@ fn try_apply_edit_script_region(
             return None;
         }
 
-        let (ialt, alt_override) = match select_fastpath_allele(rec, opts)? {
+        let selection = select_fastpath_allele(rec, opts)?;
+        let (is_missing, ialt, alt_override) = match selection {
             FastSelection::Skip => continue,
-            FastSelection::Allele { ialt, alt_override } => (ialt, alt_override),
+            FastSelection::Missing => (true, usize::MAX, None),
+            FastSelection::Allele { ialt, alt_override } => (false, ialt, alt_override),
         };
-        if ialt >= rec.alleles.len() || rec.rlen <= 0 {
-            return None;
-        }
-        let op = rec.compiled.allele_op(ialt)?;
-        if !matches!(
-            op.kind,
-            AlleleOpKind::Ref | AlleleOpKind::SameLen | AlleleOpKind::Insert | AlleleOpKind::Delete
-        ) {
+        if rec.rlen <= 0 {
             return None;
         }
 
         let rlen = rec.rlen as usize;
         let ref_allele = &rec.alleles[0];
-        if ref_allele.len() != rlen || op.ref_len as usize != rlen {
+        if ref_allele.len() != rlen {
             return None;
         }
         let idx = rec.pos - ori_pos;
@@ -520,61 +947,83 @@ fn try_apply_edit_script_region(
             return None;
         }
         let idx = idx as usize;
-        if idx + rlen > ref_seq.len() {
+        if idx + rlen > base_ref.len() {
             return None;
         }
-        if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
-            return None;
-        }
-
-        let mut alt = match alt_override {
-            Some(alt) if alt.len() == rlen && op.is_same_len_fastpath() => alt,
-            Some(_) => return None,
-            None => SmallVec::from_slice(&rec.alleles[ialt]),
-        };
-        if alt.starts_with(b"<") || alt.as_slice() == b"*" || alt.is_empty() {
-            return None;
-        }
-        if op.alt_len as usize != alt.len() {
-            return None;
-        }
-        if matches!(op.kind, AlleleOpKind::Insert | AlleleOpKind::Delete) && op.trim_beg != 1 {
+        if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
             return None;
         }
 
-        let original_len_diff = alt.len() as i64 - rlen as i64;
-        let mut len_diff = original_len_diff;
-        if original_len_diff == 0 {
+        let (alt, len_diff, count_applied) = if is_missing {
+            let missing = opts.missing_allele?;
             saw_same_len = true;
+            (repeated_allele_byte(rlen, missing), 0, true)
         } else {
-            saw_len_change = true;
-        }
-
-        if original_len_diff < 0 && opts.mark_del.is_some() {
-            alt = mark_del_bytes(ref_allele, 0, rlen as i64, Some(&alt), opts.mark_del);
-            len_diff = 0;
-        }
-        let to_upper = ref_seq[idx].is_ascii_uppercase();
-        apply_case_to_alt(&mut alt, to_upper);
-        if let Some(mark) = opts.mark_ins {
-            if len_diff > 0 {
-                let alt_len = alt.len() as i64;
-                mark_ins_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
+            if ialt >= rec.alleles.len() {
+                return None;
             }
-        }
-        if let Some(mark) = opts.mark_snv {
-            let alt_len = alt.len() as i64;
-            mark_snv_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
-        }
+            let op = rec.compiled.allele_op(ialt)?;
+            if !matches!(
+                op.kind,
+                AlleleOpKind::Ref
+                    | AlleleOpKind::SameLen
+                    | AlleleOpKind::Insert
+                    | AlleleOpKind::Delete
+            ) {
+                return None;
+            }
+            if op.ref_len as usize != rlen {
+                return None;
+            }
+            let mut alt = match alt_override {
+                Some(alt) if alt.len() == rlen && op.is_same_len_fastpath() => alt,
+                Some(_) => return None,
+                None => SmallVec::from_slice(&rec.alleles[ialt]),
+            };
+            if alt.starts_with(b"<") || alt.as_slice() == b"*" || alt.is_empty() {
+                return None;
+            }
+            if op.alt_len as usize != alt.len() {
+                return None;
+            }
+            if matches!(op.kind, AlleleOpKind::Insert | AlleleOpKind::Delete) && op.trim_beg != 1 {
+                return None;
+            }
+            let original_len_diff = alt.len() as i64 - rlen as i64;
+            let mut len_diff = original_len_diff;
+            if original_len_diff == 0 {
+                saw_same_len = true;
+            } else {
+                saw_len_change = true;
+            }
 
+            if original_len_diff < 0 && opts.mark_del.is_some() {
+                alt = mark_del_bytes(ref_allele, 0, rlen as i64, Some(&alt), opts.mark_del);
+                len_diff = 0;
+            }
+            let to_upper = base_ref[idx].is_ascii_uppercase();
+            apply_case_to_alt(&mut alt, to_upper);
+            if let Some(mark) = opts.mark_ins {
+                if len_diff > 0 {
+                    let alt_len = alt.len() as i64;
+                    mark_ins_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
+                }
+            }
+            if let Some(mark) = opts.mark_snv {
+                let alt_len = alt.len() as i64;
+                mark_snv_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
+            }
+            (alt, len_diff, true)
+        };
         total_delta += len_diff;
         patches.push(EditScriptPatch {
             idx,
             pos: rec.pos,
             rlen,
             len_diff,
+            ref_allele: SmallVec::from_slice(ref_allele),
             alt,
-            count_applied: true,
+            count_applied,
         });
         frz_pos = rec.ref_end();
     }
@@ -582,13 +1031,13 @@ fn try_apply_edit_script_region(
     if patches.is_empty() {
         if let Some(absent) = opts.absent_allele {
             return Some((
-                ApplyState::new(ori_pos, vec![absent; ref_seq.len()]).with_chr(chr),
+                ApplyState::new(ori_pos, vec![absent; base_ref.len()]).with_chr(chr),
                 FastPathLane::SameLenOnly,
             ));
         }
         return None;
     }
-    let final_len = ref_seq.len() as i64 + total_delta;
+    let final_len = base_ref.len() as i64 + total_delta;
     if final_len < 0 {
         return None;
     }
@@ -602,17 +1051,29 @@ fn try_apply_edit_script_region(
     let mut last_frz_pos = -1i64;
     let mut last_frz_mod = -1i64;
 
+    let mut cursor_check = 0usize;
     for patch in &patches {
-        if patch.idx < cursor || patch.idx + patch.rlen > ref_seq.len() {
+        if patch.idx < cursor_check || patch.idx + patch.rlen > base_ref.len() {
             return None;
         }
-        extend_gap(&mut out, ref_seq, cursor, patch.idx, opts.absent_allele);
+        cursor_check = patch.idx + patch.rlen;
+    }
 
-        let first_base = ref_seq[patch.idx];
-        let last_base = ref_seq[patch.idx + patch.rlen - 1];
+    let mut chain = chain;
+    let mut chain_mod_off = 0i64;
+    for patch in &patches {
+        extend_gap(&mut out, base_ref, cursor, patch.idx, opts.absent_allele);
+
+        let first_base = base_ref[patch.idx];
+        let last_base = base_ref[patch.idx + patch.rlen - 1];
         let to_upper = first_base.is_ascii_uppercase();
         last_case = if to_upper { TO_UPPER } else { TO_LOWER };
         out.extend_from_slice(&patch.alt);
+
+        if let Some(chain) = chain.as_deref_mut() {
+            push_edit_script_chain_gap(chain, patch, chain_mod_off);
+        }
+        chain_mod_off += patch.len_diff;
 
         cursor = patch.idx + patch.rlen;
         prev_base = last_base;
@@ -621,7 +1082,13 @@ fn try_apply_edit_script_region(
         last_frz_pos = prev_base_pos;
         last_frz_mod = out.len() as i64;
     }
-    extend_gap(&mut out, ref_seq, cursor, ref_seq.len(), opts.absent_allele);
+    extend_gap(
+        &mut out,
+        base_ref,
+        cursor,
+        base_ref.len(),
+        opts.absent_allele,
+    );
 
     let lane = if !saw_len_change {
         FastPathLane::SameLenOnly
@@ -640,6 +1107,185 @@ fn try_apply_edit_script_region(
     state.case = last_case;
     state.napplied = patches.iter().filter(|p| p.count_applied).count() as u64;
     Some((state, lane))
+}
+
+fn try_apply_edit_script_plain_apply_all_alt(
+    chr: &str,
+    ref_seq: &[u8],
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+) -> Option<(ApplyState, FastPathLane)> {
+    let mut patches: Vec<PlainEditRecord<'_>> = Vec::with_capacity(records.len());
+    let mut frz_pos = -1i64;
+    let mut total_delta = 0i64;
+    let mut saw_same_len = false;
+    let mut saw_len_change = false;
+
+    for rec in records.iter() {
+        if rec.alleles.len() == 1 {
+            continue;
+        }
+        let plain = validate_plain_edit_record(rec, ref_seq, ori_pos, frz_pos)?;
+        if plain.len_diff == 0 {
+            saw_same_len = true;
+        } else {
+            saw_len_change = true;
+        }
+        total_delta += plain.len_diff;
+        patches.push(plain);
+        frz_pos = rec.ref_end();
+    }
+    if patches.is_empty() {
+        return None;
+    }
+    let final_len = ref_seq.len() as i64 + total_delta;
+    if final_len < 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(final_len as usize);
+    let mut cursor = 0usize;
+    let mut prev_base = 0u8;
+    let mut prev_base_pos = -1i64;
+    let mut prev_is_insert = false;
+    let mut last_case = -1i8;
+    let mut last_frz_pos = -1i64;
+    let mut last_frz_mod = -1i64;
+
+    for plain in &patches {
+        extend_gap(&mut out, ref_seq, cursor, plain.idx, None);
+
+        let first_base = ref_seq[plain.idx];
+        let last_base = ref_seq[plain.idx + plain.rlen - 1];
+        let to_upper = first_base.is_ascii_uppercase();
+        last_case = if to_upper { TO_UPPER } else { TO_LOWER };
+        extend_alt_with_case_flags(&mut out, plain.alt, to_upper, plain.case_flags);
+
+        cursor = plain.idx + plain.rlen;
+        prev_base = last_base;
+        prev_base_pos = plain.pos + plain.rlen as i64 - 1;
+        prev_is_insert = plain.len_diff > 0;
+        last_frz_pos = prev_base_pos;
+        last_frz_mod = out.len() as i64;
+    }
+    extend_gap(&mut out, ref_seq, cursor, ref_seq.len(), None);
+
+    let lane = if !saw_len_change {
+        FastPathLane::SameLenOnly
+    } else if saw_same_len {
+        FastPathLane::MixedSimpleEdits
+    } else {
+        FastPathLane::NormalizedEditScript
+    };
+    let mut state = ApplyState::new(ori_pos, out).with_chr(chr);
+    state.mod_off = total_delta;
+    state.frz_pos = last_frz_pos;
+    state.frz_mod = last_frz_mod;
+    state.prev_base = prev_base;
+    state.prev_base_pos = prev_base_pos;
+    state.prev_is_insert = prev_is_insert;
+    state.case = last_case;
+    state.napplied = patches.len() as u64;
+    Some((state, lane))
+}
+
+struct PlainEditRecord<'a> {
+    pos: i64,
+    idx: usize,
+    rlen: usize,
+    alt: &'a [u8],
+    len_diff: i64,
+    case_flags: u8,
+}
+
+fn validate_plain_edit_record<'a>(
+    rec: &'a VcfRecord,
+    ref_seq: &[u8],
+    ori_pos: i64,
+    frz_pos: i64,
+) -> Option<PlainEditRecord<'a>> {
+    if rec.pos <= frz_pos || rec.rlen <= 0 || rec.alleles.len() <= 1 {
+        return None;
+    }
+    let rlen = rec.rlen as usize;
+    let ref_allele = &rec.alleles[0];
+    if ref_allele.len() != rlen {
+        return None;
+    }
+    let idx = rec.pos - ori_pos;
+    if idx < 0 {
+        return None;
+    }
+    let idx = idx as usize;
+    if idx + rlen > ref_seq.len() {
+        return None;
+    }
+    if !ref_seq[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
+        return None;
+    }
+
+    let alt = rec.alleles.get(1)?;
+    if alt.starts_with(b"<") || alt.as_slice() == b"*" || alt.is_empty() {
+        return None;
+    }
+    let op = rec.compiled.allele_op(1)?;
+    if !matches!(
+        op.kind,
+        AlleleOpKind::Ref | AlleleOpKind::SameLen | AlleleOpKind::Insert | AlleleOpKind::Delete
+    ) {
+        return None;
+    }
+    if op.ref_len as usize != rlen || op.alt_len as usize != alt.len() {
+        return None;
+    }
+    if matches!(op.kind, AlleleOpKind::Insert | AlleleOpKind::Delete) && op.trim_beg != 1 {
+        return None;
+    }
+    Some(PlainEditRecord {
+        pos: rec.pos,
+        idx,
+        rlen,
+        alt,
+        len_diff: alt.len() as i64 - rlen as i64,
+        case_flags: op.case_flags,
+    })
+}
+
+fn extend_alt_with_case_flags(out: &mut Vec<u8>, alt: &[u8], to_upper: bool, case_flags: u8) {
+    if to_upper {
+        if case_flags & ALLELE_HAS_ASCII_LOWER == 0 {
+            out.extend_from_slice(alt);
+            return;
+        }
+        out.reserve(alt.len());
+        for &src in alt {
+            out.push(src.to_ascii_uppercase());
+        }
+    } else {
+        if case_flags & ALLELE_HAS_ASCII_UPPER == 0 {
+            out.extend_from_slice(alt);
+            return;
+        }
+        out.reserve(alt.len());
+        for &src in alt {
+            out.push(src.to_ascii_lowercase());
+        }
+    }
+}
+
+fn push_edit_script_chain_gap(chain: &mut Chain, patch: &EditScriptPatch, mod_off: i64) {
+    if patch.len_diff == 0 {
+        return;
+    }
+    let rlen = patch.rlen as i64;
+    let alen = patch.alt.len() as i64;
+    let ref_b0 = patch.ref_allele.first().copied().unwrap_or(0);
+    let alt_b0 = patch.alt.first().copied().unwrap_or(0);
+    if ascii_eq_ignore_case(ref_b0, alt_b0) {
+        chain.push_gap(patch.pos + 1, rlen - 1, patch.pos + 1 + mod_off, alen - 1);
+    } else {
+        chain.push_gap(patch.pos, rlen, patch.pos + mod_off, alen);
+    }
 }
 
 fn extend_gap(out: &mut Vec<u8>, ref_seq: &[u8], start: usize, end: usize, absent: Option<u8>) {
@@ -1230,10 +1876,13 @@ fn needs_lowercase_conversion(bytes: &[u8]) -> bool {
 fn copy_alt_with_case(dst: &mut [u8], alt: &[u8], to_upper: bool) {
     debug_assert_eq!(dst.len(), alt.len());
     if alt.len() == 1 {
-        dst[0] = if to_upper {
-            alt[0].to_ascii_uppercase()
+        let b = alt[0];
+        dst[0] = if to_upper && b.is_ascii_lowercase() {
+            b.to_ascii_uppercase()
+        } else if !to_upper && b.is_ascii_uppercase() {
+            b.to_ascii_lowercase()
         } else {
-            alt[0].to_ascii_lowercase()
+            b
         };
         return;
     }
@@ -1257,13 +1906,82 @@ fn copy_alt_with_case(dst: &mut [u8], alt: &[u8], to_upper: bool) {
     }
 }
 
+fn copy_alt_with_case_flags(dst: &mut [u8], alt: &[u8], to_upper: bool, case_flags: u8) {
+    debug_assert_eq!(dst.len(), alt.len());
+    if to_upper {
+        if case_flags & ALLELE_HAS_ASCII_LOWER == 0 {
+            dst.copy_from_slice(alt);
+            return;
+        }
+        if alt.len() == 1 {
+            dst[0] = alt[0].to_ascii_uppercase();
+            return;
+        }
+        for (d, &src) in dst.iter_mut().zip(alt) {
+            *d = src.to_ascii_uppercase();
+        }
+    } else {
+        if case_flags & ALLELE_HAS_ASCII_UPPER == 0 {
+            dst.copy_from_slice(alt);
+            return;
+        }
+        if alt.len() == 1 {
+            dst[0] = alt[0].to_ascii_lowercase();
+            return;
+        }
+        for (d, &src) in dst.iter_mut().zip(alt) {
+            *d = src.to_ascii_lowercase();
+        }
+    }
+}
+
+#[inline]
+fn alt_byte_with_case_flags(alt: u8, to_upper: bool, case_flags: u8) -> u8 {
+    if to_upper {
+        if case_flags & ALLELE_HAS_ASCII_LOWER == 0 {
+            alt
+        } else {
+            alt.to_ascii_uppercase()
+        }
+    } else if case_flags & ALLELE_HAS_ASCII_UPPER == 0 {
+        alt
+    } else {
+        alt.to_ascii_lowercase()
+    }
+}
+
+#[inline]
+fn snp1_alt_with_case_flags_and_mark(
+    ref_base: u8,
+    alt: u8,
+    to_upper: bool,
+    case_flags: u8,
+    mark_snv: Option<u8>,
+) -> u8 {
+    let mut out = alt_byte_with_case_flags(alt, to_upper, case_flags);
+    if let Some(mark) = mark_snv {
+        if !ascii_eq_ignore_case(ref_base, out) {
+            out = if mark == TO_UPPER as u8 {
+                out.to_ascii_uppercase()
+            } else if mark == TO_LOWER as u8 {
+                out.to_ascii_lowercase()
+            } else {
+                mark
+            };
+        }
+    }
+    out
+}
+
 fn apply_case_to_alt(alt: &mut [u8], to_upper: bool) {
     if alt.len() == 1 {
-        alt[0] = if to_upper {
-            alt[0].to_ascii_uppercase()
-        } else {
-            alt[0].to_ascii_lowercase()
-        };
+        if to_upper {
+            if alt[0].is_ascii_lowercase() {
+                alt[0] = alt[0].to_ascii_uppercase();
+            }
+        } else if alt[0].is_ascii_uppercase() {
+            alt[0] = alt[0].to_ascii_lowercase();
+        }
         return;
     }
     let needs_conversion = if to_upper {
@@ -1460,6 +2178,7 @@ fn mark_del_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mask::{Mask, MaskWith};
     use crate::vcf_store::VcfStore;
 
     fn write_vcf(name: &str, body: &str) -> std::path::PathBuf {
@@ -1471,6 +2190,27 @@ mod tests {
             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
         std::fs::write(&vcf, format!("{}{}", header, body)).unwrap();
         vcf
+    }
+
+    fn write_vcf_gt(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_apply_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vcf = dir.join("t.vcf");
+        let header = "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=1000>\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        std::fs::write(&vcf, format!("{}{}", header, body)).unwrap();
+        vcf
+    }
+
+    fn write_mask(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_mask_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mask = dir.join("mask.bed");
+        std::fs::write(&mask, body).unwrap();
+        mask
     }
 
     fn apply_all(vcf_path: &std::path::Path, ref_seq: &[u8], ori_pos: i64, end: i64) -> Vec<u8> {
@@ -1523,6 +2263,41 @@ mod tests {
         assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
         assert_eq!(stats.same_len_fastpath_records, 2);
         assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn plain_apply_all_alt_same_len_lane_patches_alt1_directly() {
+        let vcf = write_vcf(
+            "same_len_plain_direct",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\n\
+             chr1\t5\t.\tA\tT\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let record_set = RecordSet::from_ref_slice(&recs);
+
+        let state = try_apply_same_len_plain_apply_all_alt("chr1", REF, 0, &record_set).unwrap();
+
+        assert_eq!(state.buf, b"AGGTTCGT");
+        assert_eq!(state.napplied, 2);
+    }
+
+    #[test]
+    fn plain_apply_all_alt_snp1_lane_writes_single_bytes() {
+        let vcf = write_vcf(
+            "snp1_plain_direct",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\n\
+             chr1\t5\t.\tA\tT\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let record_set = RecordSet::from_ref_slice(&recs);
+
+        let state = try_apply_snp1_plain_apply_all_alt("chr1", b"acgtacgt", 0, &record_set)
+            .expect("SNP1 plain lane should accept biallelic SNP records");
+
+        assert_eq!(state.buf, b"aggttcgt");
+        assert_eq!(state.napplied, 2);
     }
 
     #[test]
@@ -1602,6 +2377,122 @@ mod tests {
     }
 
     #[test]
+    fn same_len_fastpath_applies_nonoverlapping_char_mask() {
+        let vcf = write_vcf(
+            "same_len_mask_char_no_overlap",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\n",
+        );
+        let mask_path = write_mask("same_len_char_no_overlap", "chr1\t4\t5\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mask: Some(Arc::new(
+                Mask::load(&mask_path, MaskWith::Char(b'N')).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AGGTNCGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn same_len_fastpath_borrows_ref_when_mask_misses_region() {
+        let vcf = write_vcf("same_len_mask_misses_region", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let mask_path = write_mask("same_len_mask_misses_region", "chr1\t40\t50\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mask: Some(Arc::new(
+                Mask::load(&mask_path, MaskWith::Char(b'N')).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AGGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn char_mask_overlap_stays_on_fallback_and_skips_variant() {
+        let vcf = write_vcf("same_len_mask_char_overlap", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let mask_path = write_mask("same_len_char_overlap", "chr1\t1\t2\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mask: Some(Arc::new(
+                Mask::load(&mask_path, MaskWith::Char(b'N')).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ANGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::FallbackStateMachine), 1);
+        assert_eq!(stats.fallback_records, 1);
+        assert_eq!(stats.fallback_reason_count(FallbackReason::MaskOverlap), 1);
+    }
+
+    #[test]
+    fn same_len_fastpath_accepts_case_mask_overlap() {
+        let vcf = write_vcf("same_len_mask_lc_overlap", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let mask_path = write_mask("same_len_lc_overlap", "chr1\t1\t2\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            mask: Some(Arc::new(Mask::load(&mask_path, MaskWith::Lc).unwrap())),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AgGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn same_len_fastpath_handles_missing_char() {
+        let vcf = write_vcf_gt(
+            "same_len_missing",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t./.\n\
+             chr1\t5\t.\tA\tT\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"A?GTTCGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
     fn stats_entry_uses_empty_region_lane() {
         let opts = ApplyOptions::default();
         let mut stats = RuntimeStats::default();
@@ -1634,6 +2525,25 @@ mod tests {
         assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
         assert_eq!(stats.edit_script_fastpath_records, 2);
         assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn plain_apply_all_alt_edit_script_lane_writes_one_pass_output() {
+        let vcf = write_vcf(
+            "edit_script_plain_direct",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let record_set = RecordSet::from_ref_slice(&recs);
+
+        let (state, lane) =
+            try_apply_edit_script_plain_apply_all_alt("chr1", REF, 0, &record_set).unwrap();
+
+        assert_eq!(state.buf, b"ACAAGTAT");
+        assert_eq!(lane, FastPathLane::NormalizedEditScript);
+        assert_eq!(state.napplied, 2);
     }
 
     #[test]
@@ -1714,6 +2624,82 @@ mod tests {
         assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
         assert_eq!(stats.edit_script_fastpath_records, 1);
         assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_handles_missing_char() {
+        let vcf = write_vcf_gt(
+            "edit_script_missing",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t./.\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"A?GTAT");
+        assert_eq!(stats.lane_count(FastPathLane::MixedSimpleEdits), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_matches_state_machine_chain_output() {
+        let vcf = write_vcf(
+            "edit_script_chain_fastpath",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+
+        let plan = crate::planner::plan_region(
+            &recs,
+            PlanOptions {
+                chain: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plan.lane, FastPathLane::NormalizedEditScript);
+        let mut fast_chain = Chain::new("chr1".into(), 0, REF.len() as i64);
+        let fast = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            Some(&mut fast_chain),
+            Some(&plan),
+        );
+        let fast_chain = fast_chain.render();
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::ChainEnabled, recs.len());
+        let mut fallback_chain = Chain::new("chr1".into(), 0, REF.len() as i64);
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            Some(&mut fallback_chain),
+            Some(&fallback_plan),
+        );
+        let fallback_chain = fallback_chain.render();
+
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast_chain, fallback_chain);
     }
 
     #[test]
@@ -2273,7 +3259,7 @@ mod tests {
         {
             let theirs = bcftools_seq(&["-m", mask_bed.to_str().unwrap()]);
             let opts = ApplyOptions {
-                mask: Some(Rc::new(
+                mask: Some(Arc::new(
                     Mask::load(&mask_bed, MaskWith::Char(b'N')).unwrap(),
                 )),
                 sample_mode: SampleMode::IupacAllSamples { samples: vec![s1] },
@@ -2286,7 +3272,7 @@ mod tests {
         {
             let theirs = bcftools_seq(&["-m", mask_bed.to_str().unwrap(), "--mask-with", "lc"]);
             let opts = ApplyOptions {
-                mask: Some(Rc::new(Mask::load(&mask_bed, MaskWith::Lc).unwrap())),
+                mask: Some(Arc::new(Mask::load(&mask_bed, MaskWith::Lc).unwrap())),
                 sample_mode: SampleMode::IupacAllSamples { samples: vec![s1] },
                 ..Default::default()
             };
