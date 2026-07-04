@@ -91,8 +91,15 @@ jobs:
       - name: Install wheel
         run: pip install --no-index --find-links dist pyconsensus-rs
 
+      - name: Show installed files
+        run: pip show -f pyconsensus-rs | head -40
+
       - name: Import smoke
         run: |
+          # Import the native extension directly first so a load failure
+          # surfaces with its real error (missing NEEDED lib, etc.) instead
+          # of a misleading "No module named pyconsensus._engine".
+          python -c 'import pyconsensus._engine; print("_engine ok")'
           python -c '
           import pyconsensus
           from pyconsensus import ConsensusEngine, Task, ConsensusResult, build_tasks
@@ -117,21 +124,23 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install build deps + bcftools 1.23 via conda
+      - name: Install build deps + bcftools 1.23 via micromamba
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool make gcc cmake \
             zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
-          # The parity tests shell out to `bcftools consensus` and assert
-          # byte-identical output, so the bcftools version must match the
-          # htslib/bcftools 1.23.1 the Rust port was pinned from. apt on
-          # ubuntu-22.04 ships bcftools 1.13 (too old); install 1.23 via conda.
-          wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh
-          bash /tmp/mc.sh -b -p "$HOME/miniconda" >/dev/null
-          echo "$HOME/miniconda/bin" >> "$GITHUB_PATH"
-          conda install -y -c bioconda bcftools=1.23 tabix || \
-            conda install -y -c conda-forge -c bioconda bcftools=1.23
+          # The parity tests shell out to `bcftools consensus` / `bgzip` /
+          # `tabix` and assert byte-identical output, so the bcftools version
+          # must match the htslib/bcftools 1.23.1 the Rust port was pinned from.
+          # apt on ubuntu-22.04 ships bcftools 1.13 (too old); install 1.23 via
+          # micromamba (faster + more reliable solver than conda). Channel
+          # order conda-forge > bioconda is the bioconda-recommended setup.
+          wget -qO /tmp/micromamba https://micromamba.snakepit.net/api/micromamba/linux-64/latest
+          chmod +x /tmp/micromamba
+          /tmp/micromamba create -y --prefix "$HOME/mbenv" \
+            -c conda-forge -c bioconda bcftools=1.23 htslib=1.23 tabix
+          echo "$HOME/mbenv/bin" >> "$GITHUB_PATH"
 
       - name: Verify tools on PATH
         run: |
