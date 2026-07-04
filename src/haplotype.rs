@@ -420,7 +420,7 @@ fn select_single_sample(
                     None => continue,
                 };
                 if rec.alleles.len() <= jalt as usize {
-                    continue;
+                    fail_too_few_alts(rec, jalt);
                 }
                 let len = if jalt == 0 {
                     rec.rlen as i64
@@ -641,7 +641,7 @@ fn select_single_sample_compact(
                     continue;
                 };
                 if rec.alleles.len() <= jalt as usize {
-                    continue;
+                    fail_too_few_alts(rec, jalt);
                 }
                 let len = if jalt == 0 {
                     rec.rlen as i64
@@ -671,6 +671,17 @@ fn select_single_sample_compact(
             }
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn fail_too_few_alts(rec: &VcfRecord, ialt: i32) -> ! {
+    panic!(
+        "Broken VCF, too few alts at pos={}: ialt={} n_alleles={}",
+        rec.pos + 1,
+        ialt,
+        rec.alleles.len()
+    );
 }
 
 fn compact_selected_mask(gt: &[u16], n_allele: usize) -> u64 {
@@ -917,5 +928,78 @@ mod tests {
         let selected = select_allele(&rec, &all_sample_iupac, None);
         assert!(selected.ialt.is_some());
         assert!(selected.alt_override.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "Broken VCF, too few alts")]
+    fn pick_one_invalid_gt_allele_errors_raw_matrix() {
+        use smallvec::SmallVec;
+
+        let mut s0: SmallVec<[GtAllele; 2]> = SmallVec::new();
+        s0.push(GtAllele {
+            allele: Some(1),
+            phased: false,
+            raw: 0,
+        });
+        s0.push(GtAllele {
+            allele: Some(2),
+            phased: false,
+            raw: 0,
+        });
+        let alleles = vec![SmallVec::from_slice(b"A"), SmallVec::from_slice(b"C")];
+        let rec = VcfRecord {
+            pos: 1,
+            rlen: 1,
+            rid: 0,
+            alleles: alleles.clone(),
+            gt: vec![s0],
+            gt_compact: None,
+            gt_bits: None,
+            var_type: 1,
+            compiled: crate::compiled::CompiledRecord::from_alleles(1, &alleles),
+        };
+        let mode = SampleMode::SingleSample {
+            idx: 0,
+            spec: HaplotypeSpec::parse("A").unwrap(),
+        };
+
+        let _ = select_allele(&rec, &mode, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Broken VCF, too few alts")]
+    fn pick_one_invalid_gt_allele_errors_compact_gt() {
+        use smallvec::SmallVec;
+
+        let mut s0: SmallVec<[GtAllele; 2]> = SmallVec::new();
+        s0.push(GtAllele {
+            allele: Some(1),
+            phased: false,
+            raw: 0,
+        });
+        s0.push(GtAllele {
+            allele: Some(2),
+            phased: false,
+            raw: 0,
+        });
+        let gt = vec![s0];
+        let alleles = vec![SmallVec::from_slice(b"A"), SmallVec::from_slice(b"C")];
+        let rec = VcfRecord {
+            pos: 1,
+            rlen: 1,
+            rid: 0,
+            alleles: alleles.clone(),
+            gt: Vec::new(),
+            gt_compact: crate::vcf_store::CompactGt::from_gt(1, &gt),
+            gt_bits: None,
+            var_type: 1,
+            compiled: crate::compiled::CompiledRecord::from_alleles(1, &alleles),
+        };
+        let mode = SampleMode::SingleSample {
+            idx: 0,
+            spec: HaplotypeSpec::parse("A").unwrap(),
+        };
+
+        let _ = select_allele(&rec, &mode, None);
     }
 }

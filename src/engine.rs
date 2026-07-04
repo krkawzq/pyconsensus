@@ -8,7 +8,10 @@
 //!
 //! This module is PyO3-free; `py.rs` wraps it under the `python` feature.
 
-use crate::apply::{apply_region_planned_set, ApplyOptions, TO_LOWER, TO_UPPER};
+use crate::apply::{
+    apply_region_planned_set, apply_region_planned_set_profile, apply_region_planned_slice_profile,
+    force_fallback_state_machine, ApplyOptions, TO_LOWER, TO_UPPER,
+};
 use crate::chain::Chain;
 use crate::compiled::{
     allele_case_flags, RecordFlags, ALLELE_HAS_ASCII_LOWER, ALLELE_HAS_ASCII_UPPER,
@@ -16,13 +19,13 @@ use crate::compiled::{
 use crate::haplotype::{HaplotypeSpec, SampleMode};
 use crate::planner::{plan_region_set, PlanOptions, RegionPlan};
 use crate::ref_index::RefIndex;
-use crate::stats::FastPathLane;
+use crate::stats::{FallbackReason, FastPathLane, RuntimeStats};
 use crate::vcf_store::{LoadStrategy, RecordSet, VcfStore};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// One production task: a region + how to pick alleles for it.
 #[derive(Clone)]
@@ -77,6 +80,7 @@ struct Snp1BatchPatch<'a> {
     idx: usize,
     ref_out: u8,
     alt_out: u8,
+    missing_out: u8,
     gt_bits: &'a crate::vcf_store::BiallelicPhasedGtBits,
 }
 
@@ -87,6 +91,7 @@ struct MnpBatchPatch<'a> {
     ref_case_flags: u8,
     alt: &'a [u8],
     alt_case_flags: u8,
+    missing_out: u8,
     gt_bits: &'a crate::vcf_store::BiallelicPhasedGtBits,
     to_upper: bool,
 }
@@ -105,6 +110,15 @@ enum BatchExecutionFlavor {
     AbsentMissing { absent: u8, missing: u8 },
 }
 
+#[inline]
+fn biallelic_batch_fastpath_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    force_fallback_state_machine()
+        || *DISABLED.get_or_init(|| {
+            std::env::var_os("PYCONSENSUS_DISABLE_BIALLELIC_BATCH_FASTPATH").is_some()
+        })
+}
+
 /// One produced result.
 pub struct ConsensusResult {
     pub gene_id: String,
@@ -113,6 +127,127 @@ pub struct ConsensusResult {
     pub seq: Vec<u8>,
     pub chain: Option<String>,
     pub error: Option<String>,
+}
+
+/// Aggregate over produced consensus results for blackhole/throughput runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsensusRunStats {
+    pub n: usize,
+    pub total_len: u64,
+    pub min_len: usize,
+    pub max_len: usize,
+}
+
+impl Default for ConsensusRunStats {
+    fn default() -> Self {
+        ConsensusRunStats {
+            n: 0,
+            total_len: 0,
+            min_len: usize::MAX,
+            max_len: 0,
+        }
+    }
+}
+
+impl ConsensusRunStats {
+    fn observe(&mut self, result: ConsensusResult) -> Result<(), String> {
+        if let Some(err) = result.error {
+            return Err(format!("{}: {}", result.gene_id, err));
+        }
+        let len = result.seq.len();
+        self.n += 1;
+        self.total_len += len as u64;
+        self.min_len = self.min_len.min(len);
+        self.max_len = self.max_len.max(len);
+        Ok(())
+    }
+
+    fn merge(&mut self, other: ConsensusRunStats) {
+        if other.n == 0 {
+            return;
+        }
+        self.n += other.n;
+        self.total_len += other.total_len;
+        self.min_len = self.min_len.min(other.min_len);
+        self.max_len = self.max_len.max(other.max_len);
+    }
+
+    fn finish(mut self) -> Self {
+        if self.n == 0 {
+            self.min_len = 0;
+        }
+        self
+    }
+
+    pub fn as_tuple(&self) -> (usize, u64, usize, usize) {
+        (self.n, self.total_len, self.min_len, self.max_len)
+    }
+}
+
+/// Combined throughput and dispatch counters for a consensus run.
+#[derive(Clone, Debug, Default)]
+pub struct ConsensusRunProfile {
+    pub run: ConsensusRunStats,
+    pub runtime: RuntimeStats,
+    pub elapsed_secs: f64,
+}
+
+impl ConsensusRunProfile {
+    fn observe_result(&mut self, result: ConsensusResult) -> Result<(), String> {
+        self.runtime
+            .observe_alloc_bytes(u64::try_from(result.seq.len()).unwrap_or(u64::MAX));
+        self.run.observe(result)
+    }
+
+    fn merge(&mut self, other: ConsensusRunProfile) {
+        self.run.merge(other.run);
+        self.runtime.merge(other.runtime);
+    }
+
+    fn finish(mut self) -> Self {
+        self.run = self.run.finish();
+        self
+    }
+
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("run.n={}", self.run.n),
+            format!("run.total_len={}", self.run.total_len),
+            format!("run.min_len={}", self.run.min_len),
+            format!("run.max_len={}", self.run.max_len),
+            format!("run.elapsed_sec={:.6}", self.elapsed_secs),
+            format!(
+                "run.seq_per_sec={:.3}",
+                rate(self.run.n as f64, self.elapsed_secs)
+            ),
+            format!(
+                "run.bases_per_sec={:.3}",
+                rate(self.run.total_len as f64, self.elapsed_secs)
+            ),
+            format!(
+                "runtime.records_per_sec={:.3}",
+                rate(self.runtime.records_seen as f64, self.elapsed_secs)
+            ),
+            format!(
+                "runtime.tasks_per_sec={:.3}",
+                rate(self.runtime.tasks_total as f64, self.elapsed_secs)
+            ),
+        ];
+        lines.extend(
+            self.runtime
+                .summary_lines()
+                .into_iter()
+                .map(|line| format!("runtime.{}", line)),
+        );
+        lines
+    }
+}
+
+struct ProfiledTaskResult {
+    result: ConsensusResult,
+    lane: FastPathLane,
+    napplied: u64,
+    fallback_reason: Option<FallbackReason>,
 }
 
 /// Engine config (cli-style options applied to every task).
@@ -128,6 +263,9 @@ pub struct EngineOptions {
     pub mask_with: crate::mask::MaskWith,
     pub chain: bool,
     pub regions_overlap: u8,
+    /// 0 = unlimited; otherwise split each region/VCF group into chunks of at
+    /// most this many tasks.
+    pub max_tasks_per_group: usize,
 }
 
 /// The engine: preprocessed ref + a map of VcfStores, Send+Sync via Arc.
@@ -195,7 +333,7 @@ impl ConsensusEngine {
         let nthr = threads.max(1);
         let pool = thread_pool(nthr);
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, self.opts.max_tasks_per_group);
         let tasks = Arc::new(tasks);
         let engine = self.clone_shallow();
         let indexed: Vec<Vec<(usize, ConsensusResult)>> = pool.install(move || {
@@ -212,6 +350,88 @@ impl ConsensusEngine {
             }
         }
         out.into_iter().flatten().collect()
+    }
+
+    /// Run all tasks in parallel and consume results inside Rust.
+    ///
+    /// This is intended for throughput tests and sinks where callers do not
+    /// need every sequence materialized as Python objects. It keeps only a
+    /// small aggregate per worker group instead of the full ordered result set.
+    pub fn consensus_many_stats(
+        &self,
+        tasks: Vec<ConsensusTask>,
+        threads: usize,
+    ) -> Result<ConsensusRunStats, String> {
+        if tasks.is_empty() {
+            return Ok(ConsensusRunStats::default().finish());
+        }
+        let nthr = threads.max(1);
+        let pool = thread_pool(nthr);
+
+        let groups = group_tasks(&tasks, self.opts.max_tasks_per_group);
+        let tasks = Arc::new(tasks);
+        let engine = self.clone_shallow();
+        let stats = pool.install(move || {
+            groups
+                .par_iter()
+                .map(|group| {
+                    let mut stats = ConsensusRunStats::default();
+                    for (_, result) in engine.run_group(&tasks, group) {
+                        stats.observe(result)?;
+                    }
+                    Ok(stats)
+                })
+                .reduce(|| Ok(ConsensusRunStats::default()), merge_run_stats)
+        })?;
+        Ok(stats.finish())
+    }
+
+    /// Run tasks and return dispatch counters without materializing results to
+    /// the caller. This is the observability path for benchmark harnesses:
+    /// region grouping and biallelic batch execution remain enabled, while the
+    /// returned profile records actual lanes used by each group/task.
+    pub fn consensus_many_profile(
+        &self,
+        tasks: Vec<ConsensusTask>,
+        threads: usize,
+    ) -> Result<ConsensusRunProfile, String> {
+        if tasks.is_empty() {
+            return Ok(ConsensusRunProfile::default().finish());
+        }
+        let started = std::time::Instant::now();
+        let nthr = threads.max(1);
+        let pool = thread_pool(nthr);
+
+        let groups = group_tasks(&tasks, self.opts.max_tasks_per_group);
+        let tasks = Arc::new(tasks);
+        let engine = self.clone_shallow();
+        let mut profile = pool.install(move || {
+            groups
+                .par_iter()
+                .map(|group| engine.run_group_profile(&tasks, group))
+                .reduce(|| Ok(ConsensusRunProfile::default()), merge_run_profiles)
+        })?;
+        profile.elapsed_secs = started.elapsed().as_secs_f64();
+        Ok(profile.finish())
+    }
+
+    /// VCF-load compile counters, one key-value line per counter. The key is
+    /// prefixed by `vcf.<vcf_key>.` so callers can log the vector directly.
+    pub fn compile_stats_lines(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.vcfs.keys().cloned().collect();
+        keys.sort();
+        let mut lines = Vec::new();
+        for key in keys {
+            if let Some(vcf) = self.vcfs.get(&key) {
+                lines.extend(
+                    vcf.compile_stats()
+                        .summary_lines()
+                        .into_iter()
+                        .map(|line| format!("vcf.{}.{}", key, line)),
+                );
+            }
+        }
+        lines
     }
 
     /// Run a single task (used both standalone and inside consensus_many).
@@ -346,9 +566,10 @@ impl ConsensusEngine {
 
         let cache_enabled = has_duplicate_exec_keys(tasks, &group.indices);
         let mut output_cache: HashMap<TaskExecKey, CachedOutput> = HashMap::new();
-        let mut ref_seq = Some(ref_seq);
         let n = group.indices.len();
         let mut out = Vec::with_capacity(n);
+        let use_borrowed_ref = can_use_borrowed_ref(&plan, self.opts.chain);
+        let mut owned_ref_seq = Some(ref_seq);
         for (j, &idx) in group.indices.iter().enumerate() {
             let task = &tasks[idx];
             debug_assert_eq!(task.chr, first_task.chr);
@@ -367,29 +588,184 @@ impl ConsensusEngine {
                 None
             };
 
-            let ref_for_task = if cache_enabled {
-                ref_seq.as_ref().expect("shared ref available").clone()
-            } else if j + 1 == n {
-                ref_seq.take().expect("last task consumes shared ref")
+            let result = if use_borrowed_ref {
+                self.run_group_task_borrowed(
+                    task,
+                    vcf,
+                    owned_ref_seq
+                        .as_deref()
+                        .expect("borrowed ref path keeps shared ref"),
+                    ori_pos,
+                    &records,
+                    &plan,
+                    shared_mask.clone(),
+                )
             } else {
-                ref_seq.as_ref().expect("shared ref available").clone()
+                let ref_for_task = if cache_enabled {
+                    owned_ref_seq
+                        .as_ref()
+                        .expect("shared ref available")
+                        .clone()
+                } else if j + 1 == n {
+                    owned_ref_seq.take().expect("last task consumes shared ref")
+                } else {
+                    owned_ref_seq
+                        .as_ref()
+                        .expect("shared ref available")
+                        .clone()
+                };
+                self.run_group_task(
+                    task,
+                    vcf,
+                    ref_for_task,
+                    ori_pos,
+                    &records,
+                    &plan,
+                    shared_mask.clone(),
+                )
             };
-
-            let result = self.run_group_task(
-                task,
-                vcf,
-                ref_for_task,
-                ori_pos,
-                &records,
-                &plan,
-                shared_mask.clone(),
-            );
             if let Some(key) = cache_key {
                 output_cache.insert(key, CachedOutput::from(&result));
             }
             out.push((idx, result));
         }
         out
+    }
+
+    fn run_group_profile(
+        &self,
+        tasks: &[ConsensusTask],
+        group: &TaskGroup,
+    ) -> Result<ConsensusRunProfile, String> {
+        let mut profile = ConsensusRunProfile::default();
+        profile.runtime.observe_region();
+        profile
+            .runtime
+            .observe_tasks(u64::try_from(group.indices.len()).unwrap_or(u64::MAX));
+
+        let group_error = |err: String| -> String {
+            let first = &tasks[group.indices[0]];
+            format!(
+                "{}:{}-{}:{}: {}",
+                first.chr, first.start, first.end, first.vcf_key, err
+            )
+        };
+
+        let vcf = self
+            .vcfs
+            .get(&group.key.vcf_key)
+            .ok_or_else(|| group_error(format!("unknown vcf_key: {}", group.key.vcf_key)))?;
+
+        let ref_seq = self
+            .ref_index
+            .fetch_1based(&group.key.chr, group.key.start, group.key.end)
+            .map_err(|e| group_error(format!("ref fetch failed: {}", e)))?;
+        let ori_pos = group.key.start - 1;
+        let end0 = group.key.end - 1;
+        let records = vcf.query_set(&group.key.chr, ori_pos, end0, self.opts.regions_overlap);
+        let plan_opts = self.plan_options_for_records(&group.key.chr, &records);
+        let plan = plan_region_set(&records, plan_opts);
+
+        if let Some(batch) = self
+            .try_run_biallelic_phased_batch(tasks, group, vcf, &ref_seq, ori_pos, &records, &plan)
+        {
+            profile
+                .runtime
+                .observe_records(u64::try_from(records.len()).unwrap_or(u64::MAX));
+            profile
+                .runtime
+                .observe_lane(FastPathLane::BiallelicPhasedBatch);
+            profile.runtime.observe_same_len_fastpath_records(
+                u64::try_from(records.len()).unwrap_or(u64::MAX),
+            );
+            for (_, result) in batch {
+                profile.observe_result(result)?;
+            }
+            return Ok(profile);
+        }
+
+        let shared_mask = self.mask.clone();
+        if records.is_empty() {
+            profile.runtime.observe_lane(FastPathLane::EmptyRegion);
+            for (_, result) in
+                self.run_empty_group(tasks, group, &ref_seq, ori_pos, shared_mask.as_deref())
+            {
+                profile.observe_result(result)?;
+            }
+            return Ok(profile);
+        }
+
+        let cache_enabled = has_duplicate_exec_keys(tasks, &group.indices);
+        let mut output_cache: HashMap<TaskExecKey, CachedOutput> = HashMap::new();
+        let n = group.indices.len();
+        let use_borrowed_ref = can_use_borrowed_ref(&plan, self.opts.chain);
+        let mut owned_ref_seq = Some(ref_seq);
+        for (j, &idx) in group.indices.iter().enumerate() {
+            let task = &tasks[idx];
+            let cache_key = if cache_enabled {
+                let key = task_exec_key(task);
+                if let Some(cached) = output_cache.get(&key) {
+                    profile.observe_result(result_from_cached(task, cached))?;
+                    continue;
+                }
+                Some(key)
+            } else {
+                None
+            };
+
+            profile
+                .runtime
+                .observe_records(u64::try_from(records.len()).unwrap_or(u64::MAX));
+            let observed = if use_borrowed_ref {
+                self.run_group_task_borrowed_profile(
+                    task,
+                    vcf,
+                    owned_ref_seq
+                        .as_deref()
+                        .expect("borrowed ref path keeps shared ref"),
+                    ori_pos,
+                    &records,
+                    &plan,
+                    shared_mask.clone(),
+                )
+            } else {
+                let ref_for_task = if cache_enabled {
+                    owned_ref_seq
+                        .as_ref()
+                        .expect("shared ref available")
+                        .clone()
+                } else if j + 1 == n {
+                    owned_ref_seq.take().expect("last task consumes shared ref")
+                } else {
+                    owned_ref_seq
+                        .as_ref()
+                        .expect("shared ref available")
+                        .clone()
+                };
+                self.run_group_task_profile(
+                    task,
+                    vcf,
+                    ref_for_task,
+                    ori_pos,
+                    &records,
+                    &plan,
+                    shared_mask.clone(),
+                )
+            };
+            observe_profiled_task(
+                &mut profile,
+                observed.lane,
+                observed.napplied,
+                observed.fallback_reason,
+                records.len(),
+                &plan,
+            );
+            if let Some(key) = cache_key {
+                output_cache.insert(key, CachedOutput::from(&observed.result));
+            }
+            profile.observe_result(observed.result)?;
+        }
+        Ok(profile)
     }
 
     fn run_empty_group(
@@ -507,6 +883,191 @@ impl ConsensusEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_group_task_borrowed(
+        &self,
+        task: &ConsensusTask,
+        vcf: &VcfStore,
+        ref_seq: &[u8],
+        ori_pos: i64,
+        records: &RecordSet<'_>,
+        plan: &RegionPlan,
+        shared_mask: Option<Arc<crate::mask::Mask>>,
+    ) -> ConsensusResult {
+        let sample_mode =
+            build_sample_mode(vcf, &task.sample, &task.haplotype, self.opts.iupac_codes);
+        let opts = ApplyOptions {
+            absent_allele: self.opts.absent,
+            missing_allele: self.opts.missing,
+            mark_del: self.opts.mark_del,
+            mark_ins: self.opts.mark_ins,
+            mark_snv: self.opts.mark_snv,
+            sample_mode,
+            mask: shared_mask,
+        };
+
+        let (state, chain) = if self.opts.chain {
+            let mut chain = Chain::new(task.chr.clone(), ori_pos, ref_seq.len() as i64);
+            let (state, _lane) = apply_region_planned_slice_profile(
+                &task.chr,
+                ref_seq,
+                ori_pos,
+                records,
+                &opts,
+                Some(&mut chain),
+                Some(plan),
+            );
+            (state, Some(chain.render()))
+        } else {
+            let (state, _lane) = apply_region_planned_slice_profile(
+                &task.chr,
+                ref_seq,
+                ori_pos,
+                records,
+                &opts,
+                None,
+                Some(plan),
+            );
+            (state, None)
+        };
+        ConsensusResult {
+            gene_id: task.gene_id.clone(),
+            sample: task.sample.clone(),
+            haplotype: task.haplotype.clone(),
+            seq: state.buf,
+            chain,
+            error: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_group_task_profile(
+        &self,
+        task: &ConsensusTask,
+        vcf: &VcfStore,
+        ref_for_task: Vec<u8>,
+        ori_pos: i64,
+        records: &RecordSet<'_>,
+        plan: &RegionPlan,
+        shared_mask: Option<Arc<crate::mask::Mask>>,
+    ) -> ProfiledTaskResult {
+        let sample_mode =
+            build_sample_mode(vcf, &task.sample, &task.haplotype, self.opts.iupac_codes);
+        let opts = ApplyOptions {
+            absent_allele: self.opts.absent,
+            missing_allele: self.opts.missing,
+            mark_del: self.opts.mark_del,
+            mark_ins: self.opts.mark_ins,
+            mark_snv: self.opts.mark_snv,
+            sample_mode,
+            mask: shared_mask,
+        };
+
+        let (state, lane, chain) = if self.opts.chain {
+            let mut chain = Chain::new(task.chr.clone(), ori_pos, ref_for_task.len() as i64);
+            let (state, lane) = apply_region_planned_set_profile(
+                &task.chr,
+                ref_for_task,
+                ori_pos,
+                records,
+                &opts,
+                Some(&mut chain),
+                Some(plan),
+            );
+            (state, lane, Some(chain.render()))
+        } else {
+            let (state, lane) = apply_region_planned_set_profile(
+                &task.chr,
+                ref_for_task,
+                ori_pos,
+                records,
+                &opts,
+                None,
+                Some(plan),
+            );
+            (state, lane, None)
+        };
+        let napplied = state.napplied;
+        let fallback_reason = state.fallback_reason;
+        ProfiledTaskResult {
+            result: ConsensusResult {
+                gene_id: task.gene_id.clone(),
+                sample: task.sample.clone(),
+                haplotype: task.haplotype.clone(),
+                seq: state.buf,
+                chain,
+                error: None,
+            },
+            lane,
+            napplied,
+            fallback_reason,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_group_task_borrowed_profile(
+        &self,
+        task: &ConsensusTask,
+        vcf: &VcfStore,
+        ref_seq: &[u8],
+        ori_pos: i64,
+        records: &RecordSet<'_>,
+        plan: &RegionPlan,
+        shared_mask: Option<Arc<crate::mask::Mask>>,
+    ) -> ProfiledTaskResult {
+        let sample_mode =
+            build_sample_mode(vcf, &task.sample, &task.haplotype, self.opts.iupac_codes);
+        let opts = ApplyOptions {
+            absent_allele: self.opts.absent,
+            missing_allele: self.opts.missing,
+            mark_del: self.opts.mark_del,
+            mark_ins: self.opts.mark_ins,
+            mark_snv: self.opts.mark_snv,
+            sample_mode,
+            mask: shared_mask,
+        };
+
+        let (state, lane, chain) = if self.opts.chain {
+            let mut chain = Chain::new(task.chr.clone(), ori_pos, ref_seq.len() as i64);
+            let (state, lane) = apply_region_planned_slice_profile(
+                &task.chr,
+                ref_seq,
+                ori_pos,
+                records,
+                &opts,
+                Some(&mut chain),
+                Some(plan),
+            );
+            (state, lane, Some(chain.render()))
+        } else {
+            let (state, lane) = apply_region_planned_slice_profile(
+                &task.chr,
+                ref_seq,
+                ori_pos,
+                records,
+                &opts,
+                None,
+                Some(plan),
+            );
+            (state, lane, None)
+        };
+        let napplied = state.napplied;
+        let fallback_reason = state.fallback_reason;
+        ProfiledTaskResult {
+            result: ConsensusResult {
+                gene_id: task.gene_id.clone(),
+                sample: task.sample.clone(),
+                haplotype: task.haplotype.clone(),
+                seq: state.buf,
+                chain,
+                error: None,
+            },
+            lane,
+            napplied,
+            fallback_reason,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn try_run_biallelic_phased_batch(
         &self,
         tasks: &[ConsensusTask],
@@ -517,7 +1078,11 @@ impl ConsensusEngine {
         records: &RecordSet<'_>,
         plan: &RegionPlan,
     ) -> Option<Vec<(usize, ConsensusResult)>> {
-        if records.is_empty() || plan.lane != FastPathLane::SameLenOnly || self.opts.chain {
+        if biallelic_batch_fastpath_disabled()
+            || records.is_empty()
+            || plan.lane != FastPathLane::SameLenOnly
+            || self.opts.chain
+        {
             return None;
         }
         let base_ref_storage = self.mask.as_ref().map(|mask| {
@@ -632,6 +1197,13 @@ impl ConsensusEngine {
                 return None;
             }
             let gt_bits = vcf.compiled_gt_bits(rec_idx)?;
+            if active_samples_need_gt_fallback(
+                gt_bits,
+                &active_words_by_hap,
+                &active_word_indices_by_hap,
+            ) {
+                return None;
+            }
             let rlen = rlen_i32 as usize;
             let ref_allele = vcf.compiled_allele(rec_idx, 0)?;
             let alt_allele = vcf.compiled_allele(rec_idx, 1)?;
@@ -661,6 +1233,19 @@ impl ConsensusEngine {
             if rlen == 1 {
                 let ref_base = ref_allele[0];
                 let alt_base = alt_allele[0];
+                let missing_out = self
+                    .opts
+                    .missing
+                    .map(|missing| {
+                        snp1_alt_with_case_and_mark(
+                            ref_base,
+                            missing,
+                            to_upper,
+                            byte_case_flags(missing),
+                            self.opts.mark_snv,
+                        )
+                    })
+                    .unwrap_or(0);
                 patches.push(SameLenBatchPatch::Snp1(Snp1BatchPatch {
                     idx,
                     ref_out: snp1_alt_with_case_and_mark(
@@ -677,9 +1262,24 @@ impl ConsensusEngine {
                         alt_case_flags,
                         self.opts.mark_snv,
                     ),
+                    missing_out,
                     gt_bits,
                 }));
             } else {
+                let ref_base = ref_allele[0];
+                let missing_out = self
+                    .opts
+                    .missing
+                    .map(|missing| {
+                        snp1_alt_with_case_and_mark(
+                            ref_base,
+                            missing,
+                            to_upper,
+                            byte_case_flags(missing),
+                            self.opts.mark_snv,
+                        )
+                    })
+                    .unwrap_or(0);
                 patches.push(SameLenBatchPatch::Mnp(MnpBatchPatch {
                     idx,
                     rlen,
@@ -687,6 +1287,7 @@ impl ConsensusEngine {
                     ref_case_flags,
                     alt: alt_allele,
                     alt_case_flags,
+                    missing_out,
                     gt_bits,
                     to_upper,
                 }));
@@ -754,6 +1355,7 @@ impl ConsensusEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_run_biallelic_phased_alt_only_batch(
         &self,
         tasks: &[ConsensusTask],
@@ -773,13 +1375,13 @@ impl ConsensusEngine {
             match patch {
                 SameLenBatchPatch::RefOnly(_) => continue,
                 SameLenBatchPatch::Snp1(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let words = patch.gt_bits.alt_words_for_hap(hap)?;
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
-                            let mut bits = *words.get(word_idx)? & active_words[word_idx];
+                            let mut bits = words[word_idx] & active_words[word_idx];
                             while bits != 0 {
                                 let bit_idx = bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
@@ -794,13 +1396,13 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Mnp(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let words = patch.gt_bits.alt_words_for_hap(hap)?;
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
-                            let mut bits = *words.get(word_idx)? & active_words[word_idx];
+                            let mut bits = words[word_idx] & active_words[word_idx];
                             while bits != 0 {
                                 let bit_idx = bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
@@ -830,6 +1432,7 @@ impl ConsensusEngine {
         Some(finish_batch_outputs(tasks, output_map, buffers))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_run_biallelic_phased_missing_batch(
         &self,
         tasks: &[ConsensusTask],
@@ -839,7 +1442,7 @@ impl ConsensusEngine {
         active_words_by_hap: &[Vec<u64>; 2],
         active_word_indices_by_hap: &[Vec<usize>; 2],
         patches: &[SameLenBatchPatch<'_>],
-        missing: u8,
+        _missing: u8,
     ) -> Option<Vec<(usize, ConsensusResult)>> {
         if output_map.is_empty() {
             return None;
@@ -850,15 +1453,15 @@ impl ConsensusEngine {
             match patch {
                 SameLenBatchPatch::RefOnly(_) => continue,
                 SameLenBatchPatch::Snp1(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let mut alt_bits = *alt_words.get(word_idx)? & active;
+                            let mut alt_bits = alt_words[word_idx] & active;
                             while alt_bits != 0 {
                                 let bit_idx = alt_bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
@@ -870,14 +1473,14 @@ impl ConsensusEngine {
                                 alt_bits &= alt_bits - 1;
                             }
 
-                            let mut missing_bits = *missing_words.get(word_idx)? & active;
+                            let mut missing_bits = missing_words[word_idx] & active;
                             while missing_bits != 0 {
                                 let bit_idx = missing_bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
                                 let task_idx = task_by_sample[sample_idx];
                                 debug_assert_ne!(task_idx, usize::MAX);
                                 if task_idx != usize::MAX {
-                                    buffers[task_idx][patch.idx] = missing;
+                                    buffers[task_idx][patch.idx] = patch.missing_out;
                                 }
                                 missing_bits &= missing_bits - 1;
                             }
@@ -885,15 +1488,15 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Mnp(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let mut alt_bits = *alt_words.get(word_idx)? & active;
+                            let mut alt_bits = alt_words[word_idx] & active;
                             while alt_bits != 0 {
                                 let bit_idx = alt_bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
@@ -915,7 +1518,7 @@ impl ConsensusEngine {
                                 alt_bits &= alt_bits - 1;
                             }
 
-                            let mut missing_bits = *missing_words.get(word_idx)? & active;
+                            let mut missing_bits = missing_words[word_idx] & active;
                             while missing_bits != 0 {
                                 let bit_idx = missing_bits.trailing_zeros() as usize;
                                 let sample_idx = word_idx * 64 + bit_idx;
@@ -923,7 +1526,7 @@ impl ConsensusEngine {
                                 debug_assert_ne!(task_idx, usize::MAX);
                                 if task_idx != usize::MAX {
                                     let buf = &mut buffers[task_idx];
-                                    buf[patch.idx..patch.idx + patch.rlen].fill(missing);
+                                    buf[patch.idx] = patch.missing_out;
                                 }
                                 missing_bits &= missing_bits - 1;
                             }
@@ -936,6 +1539,7 @@ impl ConsensusEngine {
         Some(finish_batch_outputs(tasks, output_map, buffers))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_run_biallelic_phased_absent_batch(
         &self,
         tasks: &[ConsensusTask],
@@ -973,16 +1577,16 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Snp1(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let alt_bits = *alt_words.get(word_idx)? & active;
-                            let missing_bits = *missing_words.get(word_idx)? & active;
+                            let alt_bits = alt_words[word_idx] & active;
+                            let missing_bits = missing_words[word_idx] & active;
 
                             let mut ref_bits = active & !(alt_bits | missing_bits);
                             while ref_bits != 0 {
@@ -1011,16 +1615,16 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Mnp(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let alt_bits = *alt_words.get(word_idx)? & active;
-                            let missing_bits = *missing_words.get(word_idx)? & active;
+                            let alt_bits = alt_words[word_idx] & active;
+                            let missing_bits = missing_words[word_idx] & active;
 
                             let mut ref_bits = active & !(alt_bits | missing_bits);
                             while ref_bits != 0 {
@@ -1082,7 +1686,7 @@ impl ConsensusEngine {
         active_word_indices_by_hap: &[Vec<usize>; 2],
         patches: &[SameLenBatchPatch<'_>],
         absent: u8,
-        missing: u8,
+        _missing: u8,
     ) -> Option<Vec<(usize, ConsensusResult)>> {
         if output_map.is_empty() {
             return None;
@@ -1110,16 +1714,16 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Snp1(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let alt_bits = *alt_words.get(word_idx)? & active;
-                            let missing_bits = *missing_words.get(word_idx)? & active;
+                            let alt_bits = alt_words[word_idx] & active;
+                            let missing_bits = missing_words[word_idx] & active;
 
                             let mut ref_bits = active & !(alt_bits | missing_bits);
                             while ref_bits != 0 {
@@ -1152,7 +1756,7 @@ impl ConsensusEngine {
                                 let task_idx = task_by_sample[sample_idx];
                                 debug_assert_ne!(task_idx, usize::MAX);
                                 if task_idx != usize::MAX {
-                                    buffers[task_idx][patch.idx] = missing;
+                                    buffers[task_idx][patch.idx] = patch.missing_out;
                                 }
                                 missing_bits &= missing_bits - 1;
                             }
@@ -1160,16 +1764,16 @@ impl ConsensusEngine {
                     }
                 }
                 SameLenBatchPatch::Mnp(patch) => {
-                    for hap in 1..=2 {
-                        let task_by_sample = &task_by_hap_sample[hap - 1];
-                        let active_words = &active_words_by_hap[hap - 1];
-                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
-                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
-                        let missing_words = patch.gt_bits.missing_words();
+                    for hap_idx in 0..2 {
+                        let task_by_sample = &task_by_hap_sample[hap_idx];
+                        let active_words = &active_words_by_hap[hap_idx];
+                        let active_word_indices = &active_word_indices_by_hap[hap_idx];
+                        let alt_words = patch.gt_bits.alt_words_for_hap_index(hap_idx);
+                        let missing_words = patch.gt_bits.missing_words_for_hap_index(hap_idx);
                         for &word_idx in active_word_indices {
                             let active = active_words[word_idx];
-                            let alt_bits = *alt_words.get(word_idx)? & active;
-                            let missing_bits = *missing_words.get(word_idx)? & active;
+                            let alt_bits = alt_words[word_idx] & active;
+                            let missing_bits = missing_words[word_idx] & active;
 
                             let mut ref_bits = active & !(alt_bits | missing_bits);
                             while ref_bits != 0 {
@@ -1220,7 +1824,7 @@ impl ConsensusEngine {
                                 debug_assert_ne!(task_idx, usize::MAX);
                                 if task_idx != usize::MAX {
                                     let buf = &mut buffers[task_idx];
-                                    buf[patch.idx..patch.idx + patch.rlen].fill(missing);
+                                    buf[patch.idx] = patch.missing_out;
                                 }
                                 missing_bits &= missing_bits - 1;
                             }
@@ -1301,7 +1905,7 @@ impl ConsensusEngine {
         // Workers pull region-group indices; prefetch logic controls how many
         // groups are outstanding, not the raw task count.
         let (group_tx, group_rx): (Sender<usize>, Receiver<usize>) = bounded(nthr.max(1));
-        let groups = Arc::new(group_tasks(&tasks));
+        let groups = Arc::new(group_tasks(&tasks, self.opts.max_tasks_per_group));
         let n_groups = groups.len();
         let tasks = Arc::new(tasks);
 
@@ -1364,6 +1968,23 @@ impl ConsensusEngine {
             iter.submit_up_to();
         }
         iter
+    }
+
+    /// Drive the lazy iterator to completion while consuming results in Rust.
+    pub fn consensus_iter_stats(
+        &self,
+        tasks: Vec<ConsensusTask>,
+        prefetch_steps: usize,
+        warmup: bool,
+        ordered: bool,
+        threads: usize,
+    ) -> Result<ConsensusRunStats, String> {
+        let mut iter = self.consensus_iter(tasks, prefetch_steps, warmup, ordered, threads);
+        let mut stats = ConsensusRunStats::default();
+        while let Some((_, result)) = iter.next_blocking() {
+            stats.observe(result)?;
+        }
+        Ok(stats.finish())
     }
 
     /// Cheap clone for sharing across worker threads (Arc internals).
@@ -1608,7 +2229,108 @@ fn has_duplicate_exec_keys(tasks: &[ConsensusTask], indices: &[usize]) -> bool {
     false
 }
 
-fn group_tasks(tasks: &[ConsensusTask]) -> Vec<TaskGroup> {
+fn can_use_borrowed_ref(plan: &RegionPlan, chain: bool) -> bool {
+    !chain
+        && matches!(
+            plan.lane,
+            FastPathLane::SameLenOnly
+                | FastPathLane::SameLenIupac
+                | FastPathLane::NormalizedEditScript
+                | FastPathLane::MixedSimpleEdits
+        )
+}
+
+fn merge_run_stats(
+    left: Result<ConsensusRunStats, String>,
+    right: Result<ConsensusRunStats, String>,
+) -> Result<ConsensusRunStats, String> {
+    match (left, right) {
+        (Ok(mut left), Ok(right)) => {
+            left.merge(right);
+            Ok(left)
+        }
+        (Err(err), _) | (_, Err(err)) => Err(err),
+    }
+}
+
+fn rate(n: f64, elapsed_secs: f64) -> f64 {
+    if elapsed_secs > 0.0 {
+        n / elapsed_secs
+    } else {
+        0.0
+    }
+}
+
+fn merge_run_profiles(
+    left: Result<ConsensusRunProfile, String>,
+    right: Result<ConsensusRunProfile, String>,
+) -> Result<ConsensusRunProfile, String> {
+    match (left, right) {
+        (Ok(mut left), Ok(right)) => {
+            left.merge(right);
+            Ok(left)
+        }
+        (Err(err), _) | (_, Err(err)) => Err(err),
+    }
+}
+
+fn observe_profiled_task(
+    profile: &mut ConsensusRunProfile,
+    lane: FastPathLane,
+    napplied: u64,
+    fallback_reason: Option<FallbackReason>,
+    records_len: usize,
+    plan: &RegionPlan,
+) {
+    profile.runtime.observe_lane(lane);
+    match lane {
+        FastPathLane::SameLenOnly | FastPathLane::SameLenIupac => {
+            profile.runtime.observe_same_len_fastpath_records(napplied);
+        }
+        FastPathLane::BiallelicPhasedBatch => {
+            profile
+                .runtime
+                .observe_same_len_fastpath_records(u64::try_from(records_len).unwrap_or(u64::MAX));
+        }
+        FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits => {
+            profile
+                .runtime
+                .observe_edit_script_fastpath_records(napplied);
+        }
+        FastPathLane::FallbackStateMachine => {
+            profile
+                .runtime
+                .observe_fallback_records(u64::try_from(records_len).unwrap_or(u64::MAX));
+            if let Some(reason) = fallback_reason {
+                profile.runtime.observe_fallback_reason(reason);
+            } else if plan.fallback_reasons.is_empty() {
+                profile
+                    .runtime
+                    .observe_fallback_reason(FallbackReason::UnsupportedMode);
+            } else {
+                for &reason in &plan.fallback_reasons {
+                    profile.runtime.observe_fallback_reason(reason);
+                }
+            }
+        }
+        FastPathLane::EmptyRegion => {}
+    }
+}
+
+struct TaskGroupBuilder {
+    key: TaskGroupKey,
+    chunks: Vec<Vec<usize>>,
+}
+
+fn group_tasks(tasks: &[ConsensusTask], max_per_group: usize) -> Vec<TaskGroup> {
+    if max_per_group == 0 {
+        group_tasks_unlimited(tasks)
+    } else {
+        group_tasks_limited(tasks, max_per_group)
+    }
+}
+
+fn group_tasks_unlimited(tasks: &[ConsensusTask]) -> Vec<TaskGroup> {
     let mut group_index: HashMap<TaskGroupKey, usize> = HashMap::new();
     let mut groups: Vec<TaskGroup> = Vec::new();
     for (idx, task) in tasks.iter().enumerate() {
@@ -1621,6 +2343,61 @@ fn group_tasks(tasks: &[ConsensusTask]) -> Vec<TaskGroup> {
             groups.push(TaskGroup {
                 key,
                 indices: vec![idx],
+            });
+        }
+    }
+    groups
+}
+
+fn group_tasks_limited(tasks: &[ConsensusTask], max_per_group: usize) -> Vec<TaskGroup> {
+    debug_assert!(max_per_group > 0);
+    let mut group_index: HashMap<TaskGroupKey, usize> = HashMap::new();
+    let mut builders: Vec<TaskGroupBuilder> = Vec::new();
+    let chunk_capacity = max_per_group.min(128);
+
+    for (idx, task) in tasks.iter().enumerate() {
+        let key = task_group_key(task);
+        let bidx = if let Some(&bidx) = group_index.get(&key) {
+            bidx
+        } else {
+            let bidx = builders.len();
+            group_index.insert(key.clone(), bidx);
+            builders.push(TaskGroupBuilder {
+                key,
+                chunks: vec![Vec::with_capacity(chunk_capacity)],
+            });
+            bidx
+        };
+
+        let builder = &mut builders[bidx];
+        if builder
+            .chunks
+            .last()
+            .is_some_and(|chunk| chunk.len() == max_per_group)
+        {
+            builder.chunks.push(Vec::with_capacity(chunk_capacity));
+        }
+        builder
+            .chunks
+            .last_mut()
+            .expect("limited group builder always has a chunk")
+            .push(idx);
+    }
+
+    let n_groups = builders.iter().map(|builder| builder.chunks.len()).sum();
+    let mut groups = Vec::with_capacity(n_groups);
+    for mut builder in builders {
+        let last = builder.chunks.pop();
+        for indices in builder.chunks {
+            groups.push(TaskGroup {
+                key: builder.key.clone(),
+                indices,
+            });
+        }
+        if let Some(indices) = last {
+            groups.push(TaskGroup {
+                key: builder.key,
+                indices,
             });
         }
     }
@@ -1646,6 +2423,23 @@ fn result_from_cached(task: &ConsensusTask, cached: &CachedOutput) -> ConsensusR
         chain: cached.chain.clone(),
         error: cached.error.clone(),
     }
+}
+
+fn active_samples_need_gt_fallback(
+    gt_bits: &crate::vcf_store::BiallelicPhasedGtBits,
+    active_words_by_hap: &[Vec<u64>; 2],
+    active_word_indices_by_hap: &[Vec<usize>; 2],
+) -> bool {
+    let fallback_words = gt_bits.fallback_words();
+    for hap_idx in 0..2 {
+        let active_words = &active_words_by_hap[hap_idx];
+        for &word_idx in &active_word_indices_by_hap[hap_idx] {
+            if fallback_words[word_idx] & active_words[word_idx] != 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[inline]
@@ -1719,6 +2513,18 @@ fn copy_alt_with_case_flags(dst: &mut [u8], alt: &[u8], to_upper: bool, case_fla
             *d = src.to_ascii_lowercase();
         }
     }
+}
+
+#[inline]
+fn byte_case_flags(byte: u8) -> u8 {
+    let mut flags = 0u8;
+    if byte.is_ascii_lowercase() {
+        flags |= ALLELE_HAS_ASCII_LOWER;
+    }
+    if byte.is_ascii_uppercase() {
+        flags |= ALLELE_HAS_ASCII_UPPER;
+    }
+    flags
 }
 
 #[inline]
@@ -1862,6 +2668,27 @@ mod tests {
         (ref_fa, vcf)
     }
 
+    fn setup_phased_batch_with_unphased_inactive(
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_engine_test_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ref_fa = dir.join("ref.fa");
+        std::fs::write(&ref_fa, ">chr1\nACGTACGT\n").unwrap();
+        let vcf = dir.join("v.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=100>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n\
+             chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t0|1\t1|0\t0/1\n\
+             chr1\t3\t.\tG\tT\t.\t.\t.\tGT\t1|0\t0|1\t0/0\n",
+        )
+        .unwrap();
+        (ref_fa, vcf)
+    }
+
     fn setup_phased_batch_sparse_word(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("consensus_rs_engine_test_{}", name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1969,6 +2796,24 @@ mod tests {
         (ref_fa, vcf)
     }
 
+    fn setup_phased_batch_partial_missing(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_engine_test_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ref_fa = dir.join("ref.fa");
+        std::fs::write(&ref_fa, ">chr1\nACGTACGT\n").unwrap();
+        let vcf = dir.join("v.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=100>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n\
+             chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t.|1\t0|.\n",
+        )
+        .unwrap();
+        (ref_fa, vcf)
+    }
+
     fn setup_phased_batch_mnp_missing(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("consensus_rs_engine_test_{}", name));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2041,6 +2886,52 @@ mod tests {
     }
 
     #[test]
+    fn env_disable_biallelic_batch_fastpath_returns_none_when_enabled() {
+        if !biallelic_batch_fastpath_disabled() {
+            return;
+        }
+        let (ref_fa, vcf) = setup_phased_batch("env_disable_biallelic_batch");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2".into()),
+            },
+        ];
+
+        let groups = group_tasks(&tasks, 0);
+        let vcf = engine.vcfs.get("chr1").unwrap();
+        let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
+        let (records, plan) = vcf.plan_query_set(
+            "chr1",
+            0,
+            7,
+            engine.opts.regions_overlap,
+            engine.plan_options(),
+        );
+
+        assert!(engine
+            .try_run_biallelic_phased_batch(&tasks, &groups[0], vcf, &ref_seq, 0, &records, &plan)
+            .is_none());
+    }
+
+    #[test]
     fn groups_tasks_by_region_and_vcf_key() {
         let tasks = vec![
             ConsensusTask {
@@ -2071,7 +2962,7 @@ mod tests {
                 haplotype: Some("1".into()),
             },
         ];
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].indices, vec![0, 2]);
         assert_eq!(groups[1].indices, vec![1]);
@@ -2097,11 +2988,50 @@ mod tests {
                 haplotype: Some("1".into()),
             },
         ];
-        let duplicate_groups = group_tasks(&duplicate);
+        let duplicate_groups = group_tasks(&duplicate, 0);
         assert!(has_duplicate_exec_keys(
             &duplicate,
             &duplicate_groups[0].indices
         ));
+    }
+
+    #[test]
+    fn group_tasks_splits_large_groups_when_limited() {
+        let make_task = |idx: usize, start: i64, vcf_key: &str| ConsensusTask {
+            chr: "chr1".into(),
+            start,
+            end: start + 7,
+            vcf_key: vcf_key.into(),
+            gene_id: format!("G{}", idx),
+            sample: Some(format!("S{}", idx)),
+            haplotype: Some("1".into()),
+        };
+
+        let tasks: Vec<_> = (0..10).map(|idx| make_task(idx, 1, "a")).collect();
+        let unlimited = group_tasks(&tasks, 0);
+        assert_eq!(unlimited.len(), 1);
+        assert_eq!(unlimited[0].indices, (0..10).collect::<Vec<_>>());
+
+        let groups = group_tasks(&tasks, 3);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].indices, vec![0, 1, 2]);
+        assert_eq!(groups[1].indices, vec![3, 4, 5]);
+        assert_eq!(groups[2].indices, vec![6, 7, 8]);
+        assert_eq!(groups[3].indices, vec![9]);
+        assert!(groups.iter().all(|group| group.indices.len() <= 3));
+
+        let interleaved = vec![
+            make_task(0, 1, "a"),
+            make_task(1, 9, "a"),
+            make_task(2, 1, "a"),
+            make_task(3, 1, "a"),
+            make_task(4, 1, "a"),
+        ];
+        let groups = group_tasks(&interleaved, 2);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].indices, vec![0, 2]);
+        assert_eq!(groups[1].indices, vec![3, 4]);
+        assert_eq!(groups[2].indices, vec![1]);
     }
 
     #[test]
@@ -2160,6 +3090,194 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             assert_eq!(r.gene_id, format!("G{}", i));
         }
+    }
+
+    #[test]
+    fn consensus_stats_consume_results_without_returning_sequences() {
+        let (ref_fa, vcf) = setup("stats");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        let tasks: Vec<ConsensusTask> = (0..20)
+            .map(|i| ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: format!("G{}", i),
+                sample: None,
+                haplotype: None,
+            })
+            .collect();
+
+        let many = engine.consensus_many_stats(tasks.clone(), 4).unwrap();
+        assert_eq!(many.as_tuple(), (20, 160, 8, 8));
+
+        let iter = engine
+            .consensus_iter_stats(tasks, 1, true, false, 4)
+            .unwrap();
+        assert_eq!(iter, many);
+    }
+
+    #[test]
+    fn consensus_profile_reports_dispatch_and_compile_counters() {
+        let (ref_fa, vcf) = setup_phased_batch("profile_counters");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H1".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("1pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2pIu".into()),
+            },
+        ];
+
+        let profile = engine.consensus_many_profile(tasks, 2).unwrap();
+        assert_eq!(profile.run.as_tuple(), (4, 32, 8, 8));
+        assert_eq!(profile.runtime.regions_total, 1);
+        assert_eq!(profile.runtime.tasks_total, 4);
+        assert_eq!(profile.runtime.records_seen, 2);
+        assert_eq!(profile.runtime.alloc_bytes, 32);
+        assert_eq!(
+            profile
+                .runtime
+                .lane_count(FastPathLane::BiallelicPhasedBatch),
+            1
+        );
+        assert_eq!(profile.runtime.fallback_records, 0);
+        assert!(profile
+            .summary_lines()
+            .contains(&"runtime.lane.BiallelicPhasedBatch=1".to_string()));
+        assert!(profile
+            .summary_lines()
+            .iter()
+            .any(|line| line.starts_with("run.seq_per_sec=")));
+        assert!(profile
+            .summary_lines()
+            .iter()
+            .any(|line| line.starts_with("runtime.records_per_sec=")));
+        assert!(profile
+            .summary_lines()
+            .contains(&"runtime.alloc_bytes=32".to_string()));
+
+        let compile_lines = engine.compile_stats_lines();
+        assert!(compile_lines.contains(&"vcf.chr1.records_total=2".to_string()));
+        assert!(compile_lines.contains(&"vcf.chr1.biallelic_gt_bitset_records=2".to_string()));
+        assert!(compile_lines
+            .iter()
+            .any(|line| line.starts_with("vcf.chr1.allele_op.SameLen=")));
+    }
+
+    #[test]
+    fn consensus_split_preserves_results_and_stats() {
+        let (ref_fa, vcf) = setup_phased_batch("split_preserves_results");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let unlimited =
+            ConsensusEngine::load(ref_fa.clone(), vcf_map.clone(), EngineOptions::default())
+                .unwrap();
+        let limited = ConsensusEngine::load(
+            ref_fa,
+            vcf_map,
+            EngineOptions {
+                max_tasks_per_group: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H1".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2".into()),
+            },
+        ];
+
+        let expected = unlimited.consensus_many(tasks.clone(), 2);
+        let got = limited.consensus_many(tasks.clone(), 2);
+        assert_eq!(got.len(), expected.len());
+        for (got, expected) in got.iter().zip(&expected) {
+            assert_eq!(got.gene_id, expected.gene_id);
+            assert_eq!(got.sample, expected.sample);
+            assert_eq!(got.haplotype, expected.haplotype);
+            assert_eq!(got.seq, expected.seq);
+            assert_eq!(got.error, expected.error);
+        }
+
+        let expected_stats = unlimited.consensus_many_stats(tasks.clone(), 2).unwrap();
+        assert_eq!(
+            limited.consensus_many_stats(tasks.clone(), 2).unwrap(),
+            expected_stats
+        );
+        assert_eq!(
+            limited
+                .consensus_iter_stats(tasks, 2, true, false, 2)
+                .unwrap(),
+            expected_stats
+        );
     }
 
     #[test]
@@ -2383,6 +3501,72 @@ mod tests {
     }
 
     #[test]
+    fn consensus_iter_handles_split_groups_ordered_and_prefetch_zero() {
+        let (ref_fa, vcf) = setup_two_regions("iter_split_groups");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(
+            ref_fa,
+            vcf_map,
+            EngineOptions {
+                max_tasks_per_group: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "G0".into(),
+                sample: None,
+                haplotype: None,
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 9,
+                end: 12,
+                vcf_key: "chr1".into(),
+                gene_id: "G1".into(),
+                sample: None,
+                haplotype: None,
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "G2".into(),
+                sample: None,
+                haplotype: None,
+            },
+        ];
+
+        let ordered: Vec<_> = engine
+            .consensus_iter(tasks.clone(), 1, true, true, 2)
+            .collect();
+        assert_eq!(ordered.len(), 3);
+        assert_eq!(ordered[0].0, 0);
+        assert_eq!(ordered[1].0, 1);
+        assert_eq!(ordered[2].0, 2);
+        assert_eq!(ordered[0].1.seq, b"AGGTACGT");
+        assert_eq!(ordered[1].1.seq, b"AAGT");
+        assert_eq!(ordered[2].1.seq, b"AGGTACGT");
+
+        let mut unordered: Vec<_> = engine.consensus_iter(tasks, 0, false, false, 2).collect();
+        unordered.sort_by_key(|(idx, _)| *idx);
+        assert_eq!(unordered.len(), 3);
+        assert_eq!(unordered[0].0, 0);
+        assert_eq!(unordered[1].0, 1);
+        assert_eq!(unordered[2].0, 2);
+        assert_eq!(unordered[0].1.seq, b"AGGTACGT");
+        assert_eq!(unordered[1].1.seq, b"AAGT");
+        assert_eq!(unordered[2].1.seq, b"AGGTACGT");
+    }
+
+    #[test]
     fn biallelic_phased_batch_lane_patches_group_outputs() {
         let (ref_fa, vcf) = setup_phased_batch("phased_batch");
         let mut vcf_map = HashMap::new();
@@ -2427,7 +3611,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -2457,6 +3641,114 @@ mod tests {
     }
 
     #[test]
+    fn biallelic_phased_batch_ignores_unphased_inactive_samples() {
+        let (ref_fa, vcf) = setup_phased_batch_with_unphased_inactive("phased_batch_unphased");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        assert_eq!(
+            engine
+                .vcfs
+                .get("chr1")
+                .unwrap()
+                .compile_stats()
+                .biallelic_gt_bitset_records,
+            2
+        );
+
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H1".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("1pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2pIu".into()),
+            },
+        ];
+
+        let profile = engine.consensus_many_profile(tasks, 2).unwrap();
+        assert_eq!(
+            profile
+                .runtime
+                .lane_count(FastPathLane::BiallelicPhasedBatch),
+            1
+        );
+        assert_eq!(profile.runtime.fallback_records, 0);
+    }
+
+    #[test]
+    fn biallelic_phased_batch_falls_back_for_active_unphased_samples() {
+        let (ref_fa, vcf) =
+            setup_phased_batch_with_unphased_inactive("phased_batch_active_unphased");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S3H1".into(),
+                sample: Some("S3".into()),
+                haplotype: Some("1pIu".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S3H2".into(),
+                sample: Some("S3".into()),
+                haplotype: Some("2pIu".into()),
+            },
+        ];
+
+        let profile = engine.consensus_many_profile(tasks.clone(), 2).unwrap();
+        assert_eq!(
+            profile
+                .runtime
+                .lane_count(FastPathLane::BiallelicPhasedBatch),
+            0
+        );
+        assert_eq!(profile.runtime.lane_count(FastPathLane::SameLenIupac), 2);
+        assert_eq!(profile.runtime.fallback_records, 0);
+
+        let results = engine.consensus_many(tasks, 2);
+        assert_eq!(results[0].seq, b"ASGTACGT");
+        assert_eq!(results[1].seq, b"ASGTACGT");
+    }
+
+    #[test]
     fn biallelic_phased_batch_lane_handles_sparse_active_words() {
         let (ref_fa, vcf) = setup_phased_batch_sparse_word("phased_batch_sparse_word");
         let mut vcf_map = HashMap::new();
@@ -2472,7 +3764,7 @@ mod tests {
             haplotype: Some("2".into()),
         }];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -2529,7 +3821,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -2592,7 +3884,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let records = vcf.query_set("chr1", 0, 7, engine.opts.regions_overlap);
@@ -2669,7 +3961,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let records = vcf.query_set("chr1", 0, 7, engine.opts.regions_overlap);
@@ -2748,7 +4040,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let records = vcf.query_set("chr1", 0, 7, engine.opts.regions_overlap);
@@ -2825,7 +4117,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -2881,7 +4173,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -2959,7 +4251,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3023,7 +4315,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3092,7 +4384,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3172,7 +4464,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3199,6 +4491,149 @@ mod tests {
         assert_eq!(results[1].seq, b"A?GTACGT");
         assert_eq!(results[2].seq, b"ACGTACGT");
         assert_eq!(results[3].seq, b"AGGTACGT");
+    }
+
+    #[test]
+    fn biallelic_phased_batch_lane_marks_missing_snv() {
+        let (ref_fa, vcf) = setup_phased_batch_missing("phased_batch_missing_mark_snv");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(
+            ref_fa,
+            vcf_map,
+            EngineOptions {
+                missing: Some(b'?'),
+                mark_snv: Some(b'#'),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2".into()),
+            },
+        ];
+
+        let groups = group_tasks(&tasks, 0);
+        let vcf = engine.vcfs.get("chr1").unwrap();
+        let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
+        let (records, plan) = vcf.plan_query_set(
+            "chr1",
+            0,
+            7,
+            engine.opts.regions_overlap,
+            engine.plan_options(),
+        );
+        let batch = engine
+            .try_run_biallelic_phased_batch(&tasks, &groups[0], vcf, &ref_seq, 0, &records, &plan)
+            .expect("batch lane should accept missing GT with -M and mark_snv");
+        let mut by_idx = vec![Vec::new(); batch.len()];
+        for (idx, result) in batch {
+            by_idx[idx] = result.seq;
+        }
+        assert_eq!(by_idx[0], b"A#GTACGT");
+        assert_eq!(by_idx[1], b"A#GTACGT");
+
+        let results = engine.consensus_many(tasks, 2);
+        assert_eq!(results[0].seq, b"A#GTACGT");
+        assert_eq!(results[1].seq, b"A#GTACGT");
+    }
+
+    #[test]
+    fn biallelic_phased_batch_lane_handles_partial_missing_per_haplotype() {
+        let (ref_fa, vcf) = setup_phased_batch_partial_missing("phased_batch_partial_missing");
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(
+            ref_fa,
+            vcf_map,
+            EngineOptions {
+                missing: Some(b'?'),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H1".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S1H2".into(),
+                sample: Some("S1".into()),
+                haplotype: Some("2".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H1".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("1".into()),
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "S2H2".into(),
+                sample: Some("S2".into()),
+                haplotype: Some("2".into()),
+            },
+        ];
+
+        let groups = group_tasks(&tasks, 0);
+        let vcf = engine.vcfs.get("chr1").unwrap();
+        let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
+        let (records, plan) = vcf.plan_query_set(
+            "chr1",
+            0,
+            7,
+            engine.opts.regions_overlap,
+            engine.plan_options(),
+        );
+        let batch = engine
+            .try_run_biallelic_phased_batch(&tasks, &groups[0], vcf, &ref_seq, 0, &records, &plan)
+            .expect("batch lane should accept phased partial missing GT with -M");
+        let mut by_idx = vec![Vec::new(); batch.len()];
+        for (idx, result) in batch {
+            by_idx[idx] = result.seq;
+        }
+        assert_eq!(by_idx[0], b"A?GTACGT");
+        assert_eq!(by_idx[1], b"AGGTACGT");
+        assert_eq!(by_idx[2], b"ACGTACGT");
+        assert_eq!(by_idx[3], b"A?GTACGT");
+
+        let results = engine.consensus_many(tasks, 2);
+        assert_eq!(results[0].seq, b"A?GTACGT");
+        assert_eq!(results[1].seq, b"AGGTACGT");
+        assert_eq!(results[2].seq, b"ACGTACGT");
+        assert_eq!(results[3].seq, b"A?GTACGT");
     }
 
     #[test]
@@ -3254,7 +4689,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3271,14 +4706,14 @@ mod tests {
         for (idx, result) in batch {
             by_idx[idx] = result.seq;
         }
-        assert_eq!(by_idx[0], b"A??TACGT");
-        assert_eq!(by_idx[1], b"A??TACGT");
+        assert_eq!(by_idx[0], b"A?GTACGT");
+        assert_eq!(by_idx[1], b"A?GTACGT");
         assert_eq!(by_idx[2], b"ACGTACGT");
         assert_eq!(by_idx[3], b"ATTTACGT");
 
         let results = engine.consensus_many(tasks, 2);
-        assert_eq!(results[0].seq, b"A??TACGT");
-        assert_eq!(results[1].seq, b"A??TACGT");
+        assert_eq!(results[0].seq, b"A?GTACGT");
+        assert_eq!(results[1].seq, b"A?GTACGT");
         assert_eq!(results[2].seq, b"ACGTACGT");
         assert_eq!(results[3].seq, b"ATTTACGT");
     }
@@ -3328,7 +4763,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(
@@ -3345,12 +4780,12 @@ mod tests {
         for (idx, result) in batch {
             by_idx[idx] = result.seq;
         }
-        assert_eq!(by_idx[0], b"N??NNNNN");
+        assert_eq!(by_idx[0], b"N?NNNNNN");
         assert_eq!(by_idx[1], b"NCGNNNNN");
         assert_eq!(by_idx[2], b"NTTNNNNN");
 
         let results = engine.consensus_many(tasks, 2);
-        assert_eq!(results[0].seq, b"N??NNNNN");
+        assert_eq!(results[0].seq, b"N?NNNNNN");
         assert_eq!(results[1].seq, b"NCGNNNNN");
         assert_eq!(results[2].seq, b"NTTNNNNN");
     }
@@ -3400,7 +4835,7 @@ mod tests {
             },
         ];
 
-        let groups = group_tasks(&tasks);
+        let groups = group_tasks(&tasks, 0);
         let vcf = engine.vcfs.get("chr1").unwrap();
         let ref_seq = engine.ref_index.fetch_1based("chr1", 1, 8).unwrap();
         let (records, plan) = vcf.plan_query_set(

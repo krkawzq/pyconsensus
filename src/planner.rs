@@ -89,7 +89,7 @@ pub fn plan_region_set(records: &RecordSet<'_>, opts: PlanOptions) -> RegionPlan
     let mut fallback_reasons = Vec::new();
 
     for meta in records.iter_meta() {
-        if meta.flags.contains(RecordFlags::HAS_SYMBOLIC) {
+        if meta.flags.contains(RecordFlags::HAS_SYMBOLIC) && meta.kind != RecordKind::SymbolicDel {
             fallback_records += 1;
             push_unique(&mut fallback_reasons, FallbackReason::SymbolicAllele);
             continue;
@@ -193,9 +193,14 @@ mod tests {
     }
 
     #[test]
-    fn plans_symbolic_as_fallback_and_chain_keeps_simple_lanes() {
+    fn plans_symbolic_del_as_edit_script_and_chain_keeps_simple_lanes() {
         let sym = rec(1, 2, &[b"AC", b"<DEL>"]);
         let plan = plan_region(&[&sym], PlanOptions::default());
+        assert_eq!(plan.lane, FastPathLane::NormalizedEditScript);
+        assert_eq!(plan.edit_script_records, 1);
+
+        let gvcf = rec(1, 2, &[b"AC", b"<NON_REF>"]);
+        let plan = plan_region(&[&gvcf], PlanOptions::default());
         assert_eq!(plan.lane, FastPathLane::FallbackStateMachine);
         assert!(plan
             .fallback_reasons

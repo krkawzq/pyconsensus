@@ -110,6 +110,7 @@ class ConsensusEngine(_ConsensusEngine):
         mask_with: str = "N",
         chain: bool = False,
         regions_overlap: int = 1,
+        max_tasks_per_group: int = 0,
     ):
         return super().__new__(
             cls,
@@ -125,6 +126,7 @@ class ConsensusEngine(_ConsensusEngine):
             mask_with=mask_with,
             chain=chain,
             regions_overlap=regions_overlap,
+            max_tasks_per_group=max_tasks_per_group,
         )
 
     def __init__(
@@ -141,6 +143,7 @@ class ConsensusEngine(_ConsensusEngine):
         mask_with: str = "N",
         chain: bool = False,
         regions_overlap: int = 1,
+        max_tasks_per_group: int = 0,
     ) -> None:
         pass
 
@@ -153,7 +156,7 @@ class ConsensusEngine(_ConsensusEngine):
         haplotypes: Sequence[str] | None = None,
         *,
         threads: int = 1,
-        prefetch_steps: int = 16,
+        prefetch_steps: int | None = None,
         warmup: bool = False,
         ordered: bool = False,
     ) -> _ConsensusIter:
@@ -167,7 +170,9 @@ class ConsensusEngine(_ConsensusEngine):
 
         Pass ``ordered=True`` to get results back in input (region-major) order;
         the default ``ordered=False`` yields in completion order, each result
-        carrying its ``idx`` for re-pairing.
+        carrying its ``idx`` for re-pairing. ``prefetch_steps=None`` lets the
+        Rust binding use ``threads`` region groups in flight; pass ``0`` only
+        for lowest-memory, one-group-at-a-time iteration.
         """
         tasks = build_tasks(regions, samples, haplotypes)
         return self.consensus_iter(

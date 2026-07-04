@@ -23,7 +23,7 @@ use crate::engine::{ConsensusEngine, ConsensusTask, EngineOptions};
 use crate::mask::MaskWith;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyBytes, PyList, PyTuple};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -146,7 +146,7 @@ struct PyConsensusEngine {
 impl PyConsensusEngine {
     /// Construct + eagerly load ref and all VCFs.
     #[new]
-    #[pyo3(signature = (ref_path, vcfs, iupac_codes=false, missing=None, absent=None, mark_del=None, mark_ins=None, mark_snv=None, mask=None, mask_with="N".to_string(), chain=false, regions_overlap=1u8))]
+    #[pyo3(signature = (ref_path, vcfs, iupac_codes=false, missing=None, absent=None, mark_del=None, mark_ins=None, mark_snv=None, mask=None, mask_with="N".to_string(), chain=false, regions_overlap=1u8, max_tasks_per_group=0usize))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         ref_path: String,
@@ -161,6 +161,7 @@ impl PyConsensusEngine {
         mask_with: String,
         chain: bool,
         regions_overlap: u8,
+        max_tasks_per_group: usize,
     ) -> PyResult<Self> {
         let one_char = |s: &Option<String>, name: &str| -> PyResult<Option<u8>> {
             match s {
@@ -199,6 +200,7 @@ impl PyConsensusEngine {
             mask_with: parse_mask_with(&mask_with)?,
             chain,
             regions_overlap,
+            max_tasks_per_group,
         };
         let vcf_paths: HashMap<String, PathBuf> = vcfs
             .into_iter()
@@ -243,11 +245,55 @@ impl PyConsensusEngine {
         Ok(items.into_pyobject(py)?.into_any())
     }
 
+    /// Run a flat list of tasks and consume the sequences inside Rust.
+    ///
+    /// Returns `(n, total_len, min_len, max_len)`. This avoids building a large
+    /// Python list of `ConsensusResult` objects and is intended for throughput
+    /// benchmarks or sinks that discard sequence bytes.
+    #[pyo3(signature = (tasks, threads=1))]
+    fn consensus_many_stats(
+        &self,
+        py: Python<'_>,
+        tasks: Vec<PyRef<'_, PyTask>>,
+        threads: usize,
+    ) -> PyResult<(usize, u64, usize, usize)> {
+        let tasks: Vec<ConsensusTask> = tasks.iter().map(|t| t.to_inner()).collect();
+        let engine = self.inner.clone();
+        let stats = py
+            .allow_threads(move || engine.consensus_many_stats(tasks, threads))
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(stats.as_tuple())
+    }
+
+    /// Run a flat list of tasks and return key-value profile lines.
+    ///
+    /// The profile includes throughput counters plus runtime lane/fallback
+    /// counters. Sequence bytes are consumed inside Rust and are not returned.
+    #[pyo3(signature = (tasks, threads=1))]
+    fn consensus_many_profile(
+        &self,
+        py: Python<'_>,
+        tasks: Vec<PyRef<'_, PyTask>>,
+        threads: usize,
+    ) -> PyResult<Vec<String>> {
+        let tasks: Vec<ConsensusTask> = tasks.iter().map(|t| t.to_inner()).collect();
+        let engine = self.inner.clone();
+        let profile = py
+            .allow_threads(move || engine.consensus_many_profile(tasks, threads))
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(profile.summary_lines())
+    }
+
+    /// Return VCF compile-time counters as key-value lines.
+    fn compile_stats(&self) -> Vec<String> {
+        self.inner.compile_stats_lines()
+    }
+
     /// Launch a lazy iterator over `Task` objects using a producer-consumer
     /// model.
     ///
-    /// * `prefetch_steps` — 0 = no prefetch (next submits 1, blocks on it);
-    ///   N>0 = keep N tasks in flight.
+    /// * `prefetch_steps` — None = use `threads`; 0 = no prefetch (next
+    ///   submits 1, blocks on it); N>0 = keep N region groups in flight.
     /// * `warmup` — true = start prefetching at construction; false = defer to
     ///   first `next()`.
     /// * `ordered` — true = yield in input order; false = yield in completion
@@ -259,19 +305,44 @@ impl PyConsensusEngine {
     /// task's input position, needed to re-pair results when ``ordered=False``
     /// (completion order). With ``ordered=True`` idx arrives in ascending
     /// order anyway.
-    #[pyo3(signature = (tasks, prefetch_steps=0, warmup=false, ordered=false, threads=1))]
+    #[pyo3(signature = (tasks, prefetch_steps=None, warmup=false, ordered=false, threads=1))]
     fn consensus_iter(
         &self,
         tasks: Vec<PyRef<'_, PyTask>>,
-        prefetch_steps: usize,
+        prefetch_steps: Option<usize>,
         warmup: bool,
         ordered: bool,
         threads: usize,
     ) -> PyConsensusIter {
         let engine = self.inner.clone();
         let tasks: Vec<ConsensusTask> = tasks.iter().map(|t| t.to_inner()).collect();
+        let prefetch_steps = prefetch_steps.unwrap_or_else(|| threads.max(1));
         let iter = engine.consensus_iter(tasks, prefetch_steps, warmup, ordered, threads);
         PyConsensusIter { inner: Some(iter) }
+    }
+
+    /// Drive `consensus_iter` to completion and consume sequences inside Rust.
+    ///
+    /// Returns `(n, total_len, min_len, max_len)`.
+    #[pyo3(signature = (tasks, prefetch_steps=None, warmup=false, ordered=false, threads=1))]
+    fn consensus_iter_stats(
+        &self,
+        py: Python<'_>,
+        tasks: Vec<PyRef<'_, PyTask>>,
+        prefetch_steps: Option<usize>,
+        warmup: bool,
+        ordered: bool,
+        threads: usize,
+    ) -> PyResult<(usize, u64, usize, usize)> {
+        let engine = self.inner.clone();
+        let tasks: Vec<ConsensusTask> = tasks.iter().map(|t| t.to_inner()).collect();
+        let prefetch_steps = prefetch_steps.unwrap_or_else(|| threads.max(1));
+        let stats = py
+            .allow_threads(move || {
+                engine.consensus_iter_stats(tasks, prefetch_steps, warmup, ordered, threads)
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(stats.as_tuple())
     }
 }
 
@@ -322,6 +393,97 @@ impl PyConsensusIter {
                 Ok(Some(tup))
             }
         }
+    }
+
+    /// Return up to `batch_size` iterator items as a Python list.
+    ///
+    /// This amortizes Python boundary crossings for large result streams. It
+    /// returns `None` after the iterator is exhausted, matching `__next__`.
+    #[pyo3(signature = (batch_size))]
+    fn next_batch(&mut self, py: Python<'_>, batch_size: usize) -> PyResult<Option<PyObject>> {
+        if batch_size == 0 {
+            return Ok(Some(PyList::empty(py).into_any().unbind()));
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let items = py.allow_threads(|| {
+            let mut items = Vec::with_capacity(batch_size.min(1024));
+            for _ in 0..batch_size {
+                match inner.next_blocking() {
+                    Some(item) => items.push(item),
+                    None => break,
+                }
+            }
+            items
+        });
+        if items.is_empty() {
+            self.inner = None;
+            return Ok(None);
+        }
+        let mut py_items = Vec::with_capacity(items.len());
+        for (idx, r) in items {
+            if let Some(e) = r.error {
+                return Err(PyRuntimeError::new_err(format!("{}: {}", r.gene_id, e)));
+            }
+            let obj = PyConsensusResult {
+                gene_id: r.gene_id,
+                sample: r.sample,
+                haplotype: r.haplotype,
+                seq: r.seq,
+                chain: r.chain,
+            };
+            let result_obj = obj.into_pyobject(py)?.into_any().unbind();
+            let idx_obj = idx.into_pyobject(py)?.into_any().unbind();
+            py_items.push(
+                PyTuple::new(py, &[idx_obj, result_obj])?
+                    .into_any()
+                    .unbind(),
+            );
+        }
+        Ok(Some(PyList::new(py, py_items)?.into_any().unbind()))
+    }
+
+    /// Return up to `batch_size` `(idx, seq)` tuples as a Python list.
+    ///
+    /// This is the lowest-overhead Python streaming path when the caller keeps
+    /// task metadata outside the result object and only needs sequence bytes.
+    #[pyo3(signature = (batch_size))]
+    fn next_batch_bytes(
+        &mut self,
+        py: Python<'_>,
+        batch_size: usize,
+    ) -> PyResult<Option<PyObject>> {
+        if batch_size == 0 {
+            return Ok(Some(PyList::empty(py).into_any().unbind()));
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let items = py.allow_threads(|| {
+            let mut items = Vec::with_capacity(batch_size.min(1024));
+            for _ in 0..batch_size {
+                match inner.next_blocking() {
+                    Some(item) => items.push(item),
+                    None => break,
+                }
+            }
+            items
+        });
+        if items.is_empty() {
+            self.inner = None;
+            return Ok(None);
+        }
+        let mut py_items = Vec::with_capacity(items.len());
+        for (idx, r) in items {
+            if let Some(e) = r.error {
+                return Err(PyRuntimeError::new_err(format!("{}: {}", r.gene_id, e)));
+            }
+            let idx_obj = idx.into_pyobject(py)?.into_any().unbind();
+            let seq_obj = PyBytes::new(py, &r.seq).into_any().unbind();
+            py_items.push(PyTuple::new(py, &[idx_obj, seq_obj])?.into_any().unbind());
+        }
+        Ok(Some(PyList::new(py, py_items)?.into_any().unbind()))
     }
 }
 

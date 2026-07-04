@@ -29,7 +29,7 @@ features = ["python"]
 module-name = "pyconsensus._engine"
 python-source = "."
 include = [
-    "pyconsensus/__init__.pyi",
+    "pyconsensus/__init__.py",
     "pyconsensus/_engine.pyi",
     "pyconsensus/engine.py",
     "pyconsensus/py.typed",

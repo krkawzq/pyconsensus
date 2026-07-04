@@ -36,7 +36,9 @@ The bottleneck is the **repeated spawning, reparsing, and disk I/O** — not the
 
 - **🔬 Byte-exact parity with `bcftools consensus` 1.23** — a faithful line-by-line port of `forks/bcftools/consensus.c`, covering SNP / MNP / ins / del / complex-indel / `<DEL>` / gVCF `<*>` / `<NON_REF>`, `-H {R,A,I,1,2,1pIu,2pIu,LR,LA,SR,SA}` (+`NpIu`), `-I`, missing/unphased GT, `-a` / `-M` / `--mark-{del,ins,snv}` / `-m --mask-with` / `-c` chain. Pinned by `#[ignore]` tests diffing against a real `bcftools` binary.
 - **⚡ Online, no disk** — sequences yielded as `bytes` via a lazy iterator; no intermediate fasta, no temp files.
-- **🧠 Resident + multithreaded** — VCFs parsed once into an in-memory store with a binary-searchable region index; `.fai` built once; GIL released while Rust workers run.
+- **🧠 Resident + multithreaded** — VCFs parsed once into a compiled in-memory store with a binary-searchable region index, allele-operation metadata, compact GT stores, and an optional `.cvcf` cache; `.fai` built once; GIL released while Rust workers run.
+- **📈 Built-in profile counters** — `compile_stats()` reports VCF record/allele/GT layout counts, and `consensus_many_profile()` reports lane hit counts, fallback reasons, throughput rates, records seen, and output length totals without returning sequence bytes.
+- **📦 Bounded group size** — `max_tasks_per_group=0` keeps legacy unlimited grouping; positive values split large region groups for better load balance and a predictable in-flight task bound.
 
 ## Build
 
@@ -59,6 +61,7 @@ engine = ConsensusEngine(
     ref_path="ref/hg38.fa",
     vcfs={"chr1": "data/variants/chr1.vcf.gz"},
     iupac_codes=True,          # corresponds to -I
+    max_tasks_per_group=8,     # 0 = unlimited; positive values split large region groups
 )
 
 # Task coordinates are 1-based inclusive; vcf_key selects an entry of `vcfs`.
@@ -77,8 +80,20 @@ for r in results:
     print(r.gene_id, r.sample, r.haplotype, len(r.seq))   # r.seq: bytes
 
 # (2) Lazy: producer-consumer iterator; GIL released while workers run.
-for idx, r in engine.consensus_iter(tasks, threads=8, prefetch_steps=16):
+it = engine.consensus_iter(tasks, threads=8, prefetch_steps=16)
+for idx, r in it:
     ...   # r.seq feeds the downstream consumer directly
+
+# For very large result streams, batch the Python boundary crossing.
+it = engine.consensus_iter(tasks, threads=8, prefetch_steps=16)
+while (batch := it.next_batch(256)) is not None:
+    for idx, r in batch:
+        ...
+
+it = engine.consensus_iter(tasks, threads=8, prefetch_steps=16)
+while (batch := it.next_batch_bytes(256)) is not None:
+    for idx, seq in batch:
+        ...
 
 # (3) Cartesian product (regions × samples × haplotypes) -> lazy iterator.
 regions    = [Task("chr1", start, end, "chr1", "ENSG00000263280")]
@@ -86,6 +101,10 @@ samples    = ["NA12878", "NA12879"]
 haplotypes = ["1pIu", "2pIu"]
 for idx, r in engine.consensus_regions(regions, samples, haplotypes, threads=16):
     ...
+
+# (4) Observability: key-value lines suitable for logs.
+print("\n".join(engine.compile_stats()))
+print("\n".join(engine.consensus_many_profile(tasks, threads=8)))
 ```
 
 `consensus_iter` / `consensus_regions` yield in **completion order** by default,
@@ -93,6 +112,10 @@ each result carrying its input `idx` for re-pairing; pass `ordered=True` to
 yield in input order (results are buffered to reassemble). Task expansion is
 **region-major** (all haplotypes of a sample for one gene are contiguous, then
 the next sample, then the next gene) — matching the original script's layout.
+
+When `max_tasks_per_group > 0`, the number of in-flight tasks is bounded by
+`max(prefetch_steps, 1) × max_tasks_per_group`; `0` preserves the original
+unlimited group behavior.
 
 ## License
 

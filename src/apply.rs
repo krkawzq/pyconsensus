@@ -19,15 +19,57 @@ use crate::compiled::{
     allele_case_flags, AlleleOpKind, RecordKind, ALLELE_HAS_ASCII_LOWER, ALLELE_HAS_ASCII_UPPER,
 };
 use crate::haplotype::{select_allele, AlleleSelection, SampleMode};
+use crate::htslib_ffi::VCF_REF;
 use crate::mask::Mask;
 use crate::planner::{plan_region_set, PlanOptions, RegionPlan};
 use crate::stats::{FallbackReason, FastPathLane, RuntimeStats};
 use crate::vcf_store::{RecordSet, VcfRecord};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 type AlleleBuf = SmallVec<[u8; 64]>;
+
+#[inline(always)]
+fn nonnegative3(a: i64, b: i64, c: i64) -> bool {
+    (a | b | c) >= 0
+}
+
+#[inline(always)]
+fn i64_range_within(start: i64, end: i64, limit: i64) -> bool {
+    // Branch-light check for 0 <= start <= end <= limit. The wrapping
+    // subtractions keep the invariant check itself from overflowing if a caller
+    // corrupts offsets before we report the actual invariant failure.
+    (start | end | end.wrapping_sub(start) | limit.wrapping_sub(end)) >= 0
+}
+
+#[inline(always)]
+fn i64_offset_len_within(start: i64, len: i64, limit: i64) -> bool {
+    // Branch-light check for 0 <= start, 0 <= len, start + len <= limit.
+    let end = start.wrapping_add(len);
+    (start | len | end | limit.wrapping_sub(end)) >= 0
+}
+
+#[inline]
+pub(crate) fn force_fallback_state_machine() -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var_os("PYCONSENSUS_FORCE_FALLBACK_STATE_MACHINE").is_some())
+}
+
+#[inline]
+fn same_len_fastpath_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    force_fallback_state_machine()
+        || *DISABLED
+            .get_or_init(|| std::env::var_os("PYCONSENSUS_DISABLE_SAME_LEN_FASTPATH").is_some())
+}
+
+#[inline]
+fn edit_script_fastpath_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    force_fallback_state_machine()
+        || *DISABLED.get_or_init(|| std::env::var_os("PYCONSENSUS_DISABLE_EDIT_FASTPATH").is_some())
+}
 
 pub const TO_UPPER: i8 = 1;
 pub const TO_LOWER: i8 = 2;
@@ -130,6 +172,9 @@ pub struct ApplyState {
     pub buf: Vec<u8>,
     /// region chromosome name (for mask overlap queries)
     pub chr_name: String,
+    /// Reason recorded when a planned fastpath attempt falls back during
+    /// profiled execution. Consensus bytes never depend on this field.
+    pub fallback_reason: Option<FallbackReason>,
 }
 
 impl ApplyState {
@@ -146,6 +191,7 @@ impl ApplyState {
             napplied: 0,
             buf: ref_seq,
             chr_name: String::new(),
+            fallback_reason: None,
         }
     }
 
@@ -192,69 +238,92 @@ pub fn apply_region_planned_set(
     chain: Option<&mut Chain>,
     plan: Option<&RegionPlan>,
 ) -> ApplyState {
+    apply_region_planned_set_profile(chr, ref_seq, ori_pos, records, opts, chain, plan).0
+}
+
+pub fn apply_region_planned_set_profile(
+    chr: &str,
+    ref_seq: Vec<u8>,
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+    opts: &ApplyOptions,
+    chain: Option<&mut Chain>,
+    plan: Option<&RegionPlan>,
+) -> (ApplyState, FastPathLane) {
     if records.is_empty() {
-        return apply_empty_region(chr, ref_seq, ori_pos, opts);
+        return (
+            apply_empty_region(chr, ref_seq, ori_pos, opts),
+            FastPathLane::EmptyRegion,
+        );
     }
 
     let mut chain_opt = chain;
     let flavor = opts.execution_flavor(chain_opt.is_some());
-    match plan.map(|p| p.lane) {
-        Some(FastPathLane::SameLenOnly) => {
-            if let Some(state) = try_apply_same_len_region(
-                chr,
-                ref_seq.as_slice(),
-                ori_pos,
-                records,
-                opts,
-                flavor,
-                plan,
-            ) {
-                return state;
+    let mut attempted_fallback_reason = None;
+    if !force_fallback_state_machine() {
+        match plan.map(|p| p.lane) {
+            Some(FastPathLane::SameLenOnly | FastPathLane::SameLenIupac) => {
+                if let Some((state, lane)) = try_apply_same_len_region(
+                    chr,
+                    ref_seq.as_slice(),
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                ) {
+                    return (state, lane);
+                }
             }
-        }
-        Some(FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits) => {
-            if let Some((state, _lane)) = try_apply_edit_script_region(
-                chr,
-                ref_seq.as_slice(),
-                ori_pos,
-                records,
-                opts,
-                flavor,
-                plan,
-                chain_opt.as_deref_mut(),
-            ) {
-                return state;
+            Some(FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits) => {
+                match try_apply_edit_script_region_with_reason(
+                    chr,
+                    ref_seq.as_slice(),
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                    chain_opt.as_deref_mut(),
+                ) {
+                    Ok(Some((state, lane))) => return (state, lane),
+                    Ok(None) => {}
+                    Err(reason) => attempted_fallback_reason = Some(reason),
+                }
             }
-        }
-        Some(FastPathLane::FallbackStateMachine) => {}
-        _ => {
-            if let Some(state) = try_apply_same_len_region(
-                chr,
-                ref_seq.as_slice(),
-                ori_pos,
-                records,
-                opts,
-                flavor,
-                plan,
-            ) {
-                return state;
-            }
-            if let Some((state, _lane)) = try_apply_edit_script_region(
-                chr,
-                ref_seq.as_slice(),
-                ori_pos,
-                records,
-                opts,
-                flavor,
-                plan,
-                chain_opt.as_deref_mut(),
-            ) {
-                return state;
+            Some(FastPathLane::FallbackStateMachine) => {}
+            _ => {
+                if let Some((state, lane)) = try_apply_same_len_region(
+                    chr,
+                    ref_seq.as_slice(),
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                ) {
+                    return (state, lane);
+                }
+                match try_apply_edit_script_region_with_reason(
+                    chr,
+                    ref_seq.as_slice(),
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                    chain_opt.as_deref_mut(),
+                ) {
+                    Ok(Some((state, lane))) => return (state, lane),
+                    Ok(None) => {}
+                    Err(reason) => attempted_fallback_reason = Some(reason),
+                }
             }
         }
     }
 
     let mut state = ApplyState::new(ori_pos, ref_seq).with_chr(chr);
+    state.fallback_reason = attempted_fallback_reason;
     // bcftools masks each fa line on read, *before* any variant is applied
     // (consensus.c: mask_region runs in the fa-read loop; apply_variant runs
     // later on fa_buf). We mirror that here: mask the raw ref first, then apply
@@ -275,7 +344,91 @@ pub fn apply_region_planned_set(
     if let Some(absent) = opts.absent_allele {
         apply_absent(&mut state, i64::MAX, absent);
     }
-    state
+    (state, FastPathLane::FallbackStateMachine)
+}
+
+pub fn apply_region_planned_slice_profile(
+    chr: &str,
+    ref_seq: &[u8],
+    ori_pos: i64,
+    records: &RecordSet<'_>,
+    opts: &ApplyOptions,
+    chain: Option<&mut Chain>,
+    plan: Option<&RegionPlan>,
+) -> (ApplyState, FastPathLane) {
+    if records.is_empty() {
+        return (
+            apply_empty_region(chr, ref_seq.to_vec(), ori_pos, opts),
+            FastPathLane::EmptyRegion,
+        );
+    }
+
+    let mut chain_opt = chain;
+    let flavor = opts.execution_flavor(chain_opt.is_some());
+    let mut attempted_fallback_reason = None;
+    if !force_fallback_state_machine() {
+        match plan.map(|p| p.lane) {
+            Some(FastPathLane::SameLenOnly | FastPathLane::SameLenIupac) => {
+                if let Some((state, lane)) =
+                    try_apply_same_len_region(chr, ref_seq, ori_pos, records, opts, flavor, plan)
+                {
+                    return (state, lane);
+                }
+            }
+            Some(FastPathLane::NormalizedEditScript | FastPathLane::MixedSimpleEdits) => {
+                match try_apply_edit_script_region_with_reason(
+                    chr,
+                    ref_seq,
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                    chain_opt.as_deref_mut(),
+                ) {
+                    Ok(Some((state, lane))) => return (state, lane),
+                    Ok(None) => {}
+                    Err(reason) => attempted_fallback_reason = Some(reason),
+                }
+            }
+            Some(FastPathLane::FallbackStateMachine) => {}
+            _ => {
+                if let Some((state, lane)) =
+                    try_apply_same_len_region(chr, ref_seq, ori_pos, records, opts, flavor, plan)
+                {
+                    return (state, lane);
+                }
+                match try_apply_edit_script_region_with_reason(
+                    chr,
+                    ref_seq,
+                    ori_pos,
+                    records,
+                    opts,
+                    flavor,
+                    plan,
+                    chain_opt.as_deref_mut(),
+                ) {
+                    Ok(Some((state, lane))) => return (state, lane),
+                    Ok(None) => {}
+                    Err(reason) => attempted_fallback_reason = Some(reason),
+                }
+            }
+        }
+    }
+
+    let mut state = ApplyState::new(ori_pos, ref_seq.to_vec()).with_chr(chr);
+    state.fallback_reason = attempted_fallback_reason;
+    if let Some(mask) = &opts.mask {
+        mask.apply_to_buf(chr, &mut state.buf, state.ori_pos);
+    }
+    for rec in records.iter() {
+        let ch = chain_opt.as_deref_mut();
+        apply_variant(rec, &mut state, opts, ch);
+    }
+    if let Some(absent) = opts.absent_allele {
+        apply_absent(&mut state, i64::MAX, absent);
+    }
+    (state, FastPathLane::FallbackStateMachine)
 }
 
 pub fn apply_region_with_stats(
@@ -309,37 +462,46 @@ pub fn apply_region_with_stats_set(
     }
 
     let flavor = opts.execution_flavor(false);
-    if let Some(state) = try_apply_same_len_region(
-        chr,
-        ref_seq.as_slice(),
-        ori_pos,
-        records,
-        opts,
-        flavor,
-        None,
-    ) {
-        stats.observe_lane(FastPathLane::SameLenOnly);
-        for _ in 0..state.napplied {
-            stats.observe_same_len_fastpath();
+    let mut attempted_fallback_reason = None;
+    if !force_fallback_state_machine() {
+        if let Some((state, lane)) = try_apply_same_len_region(
+            chr,
+            ref_seq.as_slice(),
+            ori_pos,
+            records,
+            opts,
+            flavor,
+            None,
+        ) {
+            stats.observe_lane(lane);
+            for _ in 0..state.napplied {
+                stats.observe_same_len_fastpath();
+            }
+            return state;
         }
-        return state;
-    }
 
-    if let Some((state, lane)) = try_apply_edit_script_region(
-        chr,
-        ref_seq.as_slice(),
-        ori_pos,
-        records,
-        opts,
-        flavor,
-        None,
-        None,
-    ) {
-        stats.observe_lane(lane);
-        for _ in 0..state.napplied {
-            stats.observe_edit_script_fastpath();
+        match try_apply_edit_script_region_with_reason(
+            chr,
+            ref_seq.as_slice(),
+            ori_pos,
+            records,
+            opts,
+            flavor,
+            None,
+            None,
+        ) {
+            Ok(Some((state, lane))) => {
+                stats.observe_lane(lane);
+                for _ in 0..state.napplied {
+                    stats.observe_edit_script_fastpath();
+                }
+                return state;
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                attempted_fallback_reason = Some(reason);
+            }
         }
-        return state;
     }
 
     let plan_opts = PlanOptions {
@@ -358,7 +520,9 @@ pub fn apply_region_with_stats_set(
     let plan = plan_region_set(records, plan_opts);
     stats.observe_lane(FastPathLane::FallbackStateMachine);
     stats.observe_fallback_records(records.len() as u64);
-    if plan.fallback_reasons.is_empty() {
+    if let Some(reason) = attempted_fallback_reason {
+        stats.observe_fallback_reason(reason);
+    } else if plan.fallback_reasons.is_empty() {
         stats.observe_fallback_reason(FallbackReason::UnsupportedMode);
     } else {
         for reason in plan.fallback_reasons {
@@ -447,10 +611,40 @@ fn select_biallelic_hap_fastpath(
     }
 }
 
+#[inline]
+fn selected_ref_short_circuits(opts: &ApplyOptions) -> bool {
+    matches!(opts.sample_mode, SampleMode::SingleSample { .. })
+}
+
 fn repeated_allele_byte(len: usize, byte: u8) -> AlleleBuf {
     let mut out = AlleleBuf::new();
     out.resize(len, byte);
     out
+}
+
+#[inline]
+fn missing_uses_ref_block(rec: &VcfRecord) -> bool {
+    rec.rlen > 1 && rec.var_type == VCF_REF
+}
+
+#[inline]
+fn missing_replacement_len(rec: &VcfRecord) -> usize {
+    if missing_uses_ref_block(rec) {
+        rec.rlen as usize
+    } else {
+        1
+    }
+}
+
+#[inline]
+fn missing_anchor_matches_ref(rec: &VcfRecord, base_ref: &[u8], idx: usize) -> bool {
+    if missing_uses_ref_block(rec) {
+        return true;
+    }
+    rec.alleles
+        .first()
+        .and_then(|a| a.first())
+        .is_some_and(|&ref_base| ascii_eq_ignore_case(base_ref[idx], ref_base))
 }
 
 #[inline]
@@ -506,17 +700,20 @@ fn try_apply_same_len_region(
     opts: &ApplyOptions,
     flavor: ApplyExecutionFlavor,
     plan: Option<&RegionPlan>,
-) -> Option<ApplyState> {
+) -> Option<(ApplyState, FastPathLane)> {
+    if same_len_fastpath_disabled() {
+        return None;
+    }
     if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
         return None;
     }
     if opts.is_plain_apply_all_alt(flavor) {
         if let Some(state) = try_apply_snp1_plain_apply_all_alt(chr, ref_seq, ori_pos, records) {
-            return Some(state);
+            return Some((state, FastPathLane::SameLenOnly));
         }
         if let Some(state) = try_apply_same_len_plain_apply_all_alt(chr, ref_seq, ori_pos, records)
         {
-            return Some(state);
+            return Some((state, FastPathLane::SameLenOnly));
         }
     }
     let base_ref = fastpath_ref_seq(chr, ref_seq, ori_pos, opts);
@@ -524,6 +721,7 @@ fn try_apply_same_len_region(
 
     let mut patches: Vec<SameLenRegionPatch<'_>> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
+    let mut saw_iupac_override = false;
     for rec in records.iter() {
         if rec.alleles.len() == 1 {
             if opts.absent_allele.is_none() {
@@ -561,32 +759,35 @@ fn try_apply_same_len_region(
             frz_pos = rec.ref_end();
             continue;
         }
-        if rec.pos <= frz_pos {
-            return None;
-        }
         let selection = select_fastpath_allele(rec, opts)?;
         let (is_missing, ialt, alt_override) = match selection {
             FastSelection::Skip => continue,
             FastSelection::Missing => (true, usize::MAX, None),
             FastSelection::Allele { ialt, alt_override } => (false, ialt, alt_override),
         };
+        if !is_missing && ialt == 0 && selected_ref_short_circuits(opts) {
+            if opts.absent_allele.is_none() {
+                continue;
+            }
+            return None;
+        }
+        if rec.pos <= frz_pos {
+            return None;
+        }
         if rec.rlen <= 0 {
             return None;
         }
-        let rlen = rec.rlen as usize;
         let idx = rec.pos - ori_pos;
         if idx < 0 {
             return None;
         }
         let idx = idx as usize;
-        if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
-            return None;
-        }
-        if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
-            return None;
-        }
 
         if is_missing {
+            let rlen = missing_replacement_len(rec);
+            if idx + rlen > base_ref.len() || !missing_anchor_matches_ref(rec, base_ref, idx) {
+                return None;
+            }
             let missing = opts.missing_allele?;
             patches.push(SameLenRegionPatch::Missing {
                 idx,
@@ -594,12 +795,21 @@ fn try_apply_same_len_region(
                 rlen,
                 missing,
             });
+            frz_pos = rec.pos + rlen as i64 - 1;
         } else {
+            let rlen = rec.rlen as usize;
+            if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
+                return None;
+            }
+            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+                return None;
+            }
             if ialt >= rec.alleles.len() {
                 return None;
             }
             match alt_override {
                 Some(alt) if alt.len() == rlen => {
+                    saw_iupac_override = true;
                     let case_flags = allele_case_flags(&alt);
                     patches.push(SameLenRegionPatch::Allele {
                         idx,
@@ -631,13 +841,16 @@ fn try_apply_same_len_region(
                 }
                 None => return None,
             }
+            frz_pos = rec.ref_end();
         };
-        frz_pos = rec.ref_end();
     }
 
     if patches.is_empty() {
         if let Some(absent) = opts.absent_allele {
-            return Some(ApplyState::new(ori_pos, vec![absent; base_ref.len()]).with_chr(chr));
+            return Some((
+                ApplyState::new(ori_pos, vec![absent; base_ref.len()]).with_chr(chr),
+                FastPathLane::SameLenOnly,
+            ));
         }
         return None;
     }
@@ -675,11 +888,23 @@ fn try_apply_same_len_region(
                 rlen,
                 missing,
             } => apply_same_len_missing_patch(
-                &mut state, base_ref, *idx, *pos, *rlen, *missing, true,
+                &mut state,
+                base_ref,
+                *idx,
+                *pos,
+                *rlen,
+                *missing,
+                true,
+                opts.mark_snv,
             ),
         }
     }
-    Some(state)
+    let lane = if saw_iupac_override {
+        FastPathLane::SameLenIupac
+    } else {
+        FastPathLane::SameLenOnly
+    };
+    Some((state, lane))
 }
 
 enum SameLenPatchAlt<'a> {
@@ -719,6 +944,9 @@ fn try_apply_same_len_plain_apply_all_alt(
     ori_pos: i64,
     records: &RecordSet<'_>,
 ) -> Option<ApplyState> {
+    if same_len_fastpath_disabled() {
+        return None;
+    }
     let mut patches: Vec<SameLenPlainPatch<'_>> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
     for rec in records.iter() {
@@ -783,6 +1011,9 @@ fn try_apply_snp1_plain_apply_all_alt(
     ori_pos: i64,
     records: &RecordSet<'_>,
 ) -> Option<ApplyState> {
+    if same_len_fastpath_disabled() {
+        return None;
+    }
     let mut patches: Vec<Snp1PlainPatch> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
     for rec in records.iter() {
@@ -884,6 +1115,7 @@ fn apply_same_len_plain_patch(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn apply_same_len_patch(
     state: &mut ApplyState,
     base_ref: &[u8],
@@ -920,6 +1152,7 @@ fn apply_same_len_patch(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn apply_same_len_missing_patch(
     state: &mut ApplyState,
     base_ref: &[u8],
@@ -928,15 +1161,22 @@ fn apply_same_len_missing_patch(
     rlen: usize,
     missing: u8,
     count_applied: bool,
+    mark_snv: Option<u8>,
 ) {
     let first_base = base_ref[idx];
     let last_base = base_ref[idx + rlen - 1];
+    let to_upper = first_base.is_ascii_uppercase();
     state.case = if first_base.is_ascii_uppercase() {
         TO_UPPER
     } else {
         TO_LOWER
     };
-    state.buf[idx..idx + rlen].fill(missing);
+    let dst = &mut state.buf[idx..idx + rlen];
+    dst.fill(missing);
+    apply_case_to_alt(dst, to_upper);
+    if let Some(mark) = mark_snv {
+        mark_snv_bytes(&base_ref[idx..idx + rlen], 0, dst, 0, rlen as i64, mark);
+    }
     state.prev_base = last_base;
     state.prev_base_pos = pos + rlen as i64 - 1;
     state.prev_is_insert = false;
@@ -954,10 +1194,11 @@ struct EditScriptPatch {
     len_diff: i64,
     ref_allele: AlleleBuf,
     alt: AlleleBuf,
-    count_applied: bool,
+    applied_count: u64,
 }
 
-fn try_apply_edit_script_region(
+#[allow(clippy::too_many_arguments)]
+fn try_apply_edit_script_region_with_reason(
     chr: &str,
     ref_seq: &[u8],
     ori_pos: i64,
@@ -966,15 +1207,21 @@ fn try_apply_edit_script_region(
     flavor: ApplyExecutionFlavor,
     plan: Option<&RegionPlan>,
     chain: Option<&mut Chain>,
-) -> Option<(ApplyState, FastPathLane)> {
-    if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
-        return None;
+) -> Result<Option<(ApplyState, FastPathLane)>, FallbackReason> {
+    if edit_script_fastpath_disabled() {
+        return Err(FallbackReason::UnsupportedMode);
+    }
+    if records.is_empty() {
+        return Ok(None);
+    }
+    if !mask_allows_variant_fastpath(chr, records, opts, plan) {
+        return Err(FallbackReason::MaskOverlap);
     }
     if opts.is_plain_apply_all_alt(flavor) {
         if let Some(state_and_lane) =
             try_apply_edit_script_plain_apply_all_alt(chr, ref_seq, ori_pos, records)
         {
-            return Some(state_and_lane);
+            return Ok(Some(state_and_lane));
         }
     }
     let base_ref = fastpath_ref_seq(chr, ref_seq, ori_pos, opts);
@@ -982,6 +1229,7 @@ fn try_apply_edit_script_region(
 
     let mut patches: Vec<EditScriptPatch> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
+    let mut prev_is_insert_for_overlap = false;
     let mut total_delta = 0i64;
     let mut saw_same_len = false;
     let mut saw_len_change = false;
@@ -992,19 +1240,19 @@ fn try_apply_edit_script_region(
                 continue;
             }
             if rec.pos <= frz_pos || rec.rlen <= 0 {
-                return None;
+                return Err(FallbackReason::VariantOverlap);
             }
             let rlen = rec.rlen as usize;
             let idx = rec.pos - ori_pos;
             if idx < 0 {
-                return None;
+                return Err(FallbackReason::RefMismatch);
             }
             let idx = idx as usize;
             if idx + rlen > base_ref.len() || rec.alleles[0].len() != rlen {
-                return None;
+                return Err(FallbackReason::RefMismatch);
             }
             if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
-                return None;
+                return Err(FallbackReason::RefMismatch);
             }
             let to_upper = base_ref[idx].is_ascii_uppercase();
             let mut alt = SmallVec::from_slice(&rec.alleles[0]);
@@ -1020,79 +1268,122 @@ fn try_apply_edit_script_region(
                 len_diff: 0,
                 ref_allele: SmallVec::from_slice(&rec.alleles[0]),
                 alt,
-                count_applied: false,
+                applied_count: 0,
             });
             saw_same_len = true;
             frz_pos = rec.ref_end();
+            prev_is_insert_for_overlap = false;
             continue;
         }
-        if rec.pos <= frz_pos {
-            return None;
-        }
 
-        let selection = select_fastpath_allele(rec, opts)?;
+        let selection = select_fastpath_allele(rec, opts).ok_or(FallbackReason::UnsupportedMode)?;
         let (is_missing, ialt, alt_override) = match selection {
             FastSelection::Skip => continue,
             FastSelection::Missing => (true, usize::MAX, None),
             FastSelection::Allele { ialt, alt_override } => (false, ialt, alt_override),
         };
         if rec.rlen <= 0 {
-            return None;
+            return Err(FallbackReason::ComplexAllele);
         }
 
-        let rlen = rec.rlen as usize;
-        let ref_allele = &rec.alleles[0];
-        if ref_allele.len() != rlen {
-            return None;
+        if !is_missing && ialt == 0 && selected_ref_short_circuits(opts) {
+            if opts.absent_allele.is_none() {
+                continue;
+            }
+            return Err(FallbackReason::UnsupportedMode);
         }
         let idx = rec.pos - ori_pos;
         if idx < 0 {
-            return None;
+            return Err(FallbackReason::RefMismatch);
         }
         let idx = idx as usize;
-        if idx + rlen > base_ref.len() {
-            return None;
-        }
-        if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
-            return None;
-        }
 
-        let (alt, len_diff, count_applied) = if is_missing {
-            let missing = opts.missing_allele?;
-            saw_same_len = true;
-            (repeated_allele_byte(rlen, missing), 0, true)
-        } else {
-            if ialt >= rec.alleles.len() {
-                return None;
+        let (
+            rlen,
+            ref_allele,
+            alt,
+            len_diff,
+            count_applied,
+            overlap_trim_beg,
+            overlap_len_diff,
+            selected_ref,
+        ) = if is_missing {
+            let rlen = missing_replacement_len(rec);
+            if idx + rlen > base_ref.len() || !missing_anchor_matches_ref(rec, base_ref, idx) {
+                return Err(FallbackReason::RefMismatch);
             }
-            let op = rec.compiled.allele_op(ialt)?;
+            let missing = opts.missing_allele.ok_or(FallbackReason::MissingGt)?;
+            let ref_allele = SmallVec::from_slice(&base_ref[idx..idx + rlen]);
+            let mut alt = repeated_allele_byte(rlen, missing);
+            let to_upper = base_ref[idx].is_ascii_uppercase();
+            apply_case_to_alt(&mut alt, to_upper);
+            if let Some(mark) = opts.mark_snv {
+                mark_snv_bytes(&ref_allele, 0, &mut alt, 0, rlen as i64, mark);
+            }
+            saw_same_len = true;
+            (rlen, ref_allele, alt, 0, true, 0u16, 0i64, false)
+        } else {
+            let rlen = rec.rlen as usize;
+            let ref_allele = &rec.alleles[0];
+            if ref_allele.len() != rlen {
+                return Err(FallbackReason::RefMismatch);
+            }
+            if idx + rlen > base_ref.len() {
+                return Err(FallbackReason::RefMismatch);
+            }
+            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
+                return Err(FallbackReason::RefMismatch);
+            }
+            if ialt >= rec.alleles.len() {
+                return Err(FallbackReason::ComplexAllele);
+            }
+            let op = rec
+                .compiled
+                .allele_op(ialt)
+                .ok_or(FallbackReason::ComplexAllele)?;
             if !matches!(
                 op.kind,
                 AlleleOpKind::Ref
                     | AlleleOpKind::SameLen
                     | AlleleOpKind::Insert
                     | AlleleOpKind::Delete
+                    | AlleleOpKind::SymbolicDel
             ) {
-                return None;
+                return Err(FallbackReason::ComplexAllele);
             }
             if op.ref_len as usize != rlen {
-                return None;
+                return Err(FallbackReason::ComplexAllele);
             }
-            let mut alt = match alt_override {
-                Some(alt) if alt.len() == rlen && op.is_same_len_fastpath() => alt,
-                Some(_) => return None,
-                None => SmallVec::from_slice(&rec.alleles[ialt]),
+            let symbolic_del = op.kind == AlleleOpKind::SymbolicDel;
+            let mut alt = if symbolic_del {
+                if alt_override.is_some() || ref_allele.is_empty() || op.trim_beg != 1 {
+                    return Err(FallbackReason::ComplexAllele);
+                }
+                SmallVec::from_slice(&ref_allele[..1])
+            } else {
+                let alt = match alt_override {
+                    Some(alt) if alt.len() == op.alt_len as usize => alt,
+                    Some(_) => return Err(FallbackReason::LengthChangingEdit),
+                    None => SmallVec::from_slice(&rec.alleles[ialt]),
+                };
+                if alt.starts_with(b"<") || alt.as_slice() == b"*" || alt.is_empty() {
+                    return Err(FallbackReason::SymbolicAllele);
+                }
+                if op.alt_len as usize != alt.len() {
+                    return Err(FallbackReason::ComplexAllele);
+                }
+                if matches!(op.kind, AlleleOpKind::Insert | AlleleOpKind::Delete)
+                    && op.trim_beg != 1
+                {
+                    return Err(FallbackReason::LengthChangingEdit);
+                }
+                alt
             };
-            if alt.starts_with(b"<") || alt.as_slice() == b"*" || alt.is_empty() {
-                return None;
-            }
-            if op.alt_len as usize != alt.len() {
-                return None;
-            }
-            if matches!(op.kind, AlleleOpKind::Insert | AlleleOpKind::Delete) && op.trim_beg != 1 {
-                return None;
-            }
-            let original_len_diff = alt.len() as i64 - rlen as i64;
+            let original_len_diff = if symbolic_del {
+                op.len_diff as i64
+            } else {
+                alt.len() as i64 - rlen as i64
+            };
             let mut len_diff = original_len_diff;
             if original_len_diff == 0 {
                 saw_same_len = true;
@@ -1100,7 +1391,10 @@ fn try_apply_edit_script_region(
                 saw_len_change = true;
             }
 
-            if original_len_diff < 0 && opts.mark_del.is_some() {
+            if symbolic_del && opts.mark_del.is_some() {
+                alt = mark_del_bytes(ref_allele, 0, rlen as i64, None, opts.mark_del);
+                len_diff = 0;
+            } else if original_len_diff < 0 && opts.mark_del.is_some() {
                 alt = mark_del_bytes(ref_allele, 0, rlen as i64, Some(&alt), opts.mark_del);
                 len_diff = 0;
             }
@@ -1116,33 +1410,68 @@ fn try_apply_edit_script_region(
                 let alt_len = alt.len() as i64;
                 mark_snv_bytes(ref_allele, 0, &mut alt, 0, alt_len, mark);
             }
-            (alt, len_diff, true)
+            (
+                rlen,
+                SmallVec::from_slice(ref_allele),
+                alt,
+                len_diff,
+                true,
+                op.trim_beg,
+                original_len_diff,
+                ialt == 0,
+            )
         };
+        if rec.pos <= frz_pos {
+            if is_missing {
+                return Err(FallbackReason::VariantOverlap);
+            }
+            if selected_ref {
+                if opts.absent_allele.is_some() {
+                    return Err(FallbackReason::VariantOverlap);
+                }
+                if rec.ref_end() > frz_pos {
+                    return Err(FallbackReason::VariantOverlap);
+                }
+                continue;
+            }
+            let state_machine_skips = rec.pos < frz_pos
+                || overlap_trim_beg == 0
+                || overlap_len_diff == 0
+                || prev_is_insert_for_overlap;
+            if state_machine_skips {
+                continue;
+            }
+            return Err(FallbackReason::VariantOverlap);
+        }
         total_delta += len_diff;
         patches.push(EditScriptPatch {
             idx,
             pos: rec.pos,
             rlen,
             len_diff,
-            ref_allele: SmallVec::from_slice(ref_allele),
+            ref_allele,
             alt,
-            count_applied,
+            applied_count: u64::from(count_applied),
         });
-        frz_pos = rec.ref_end();
+        frz_pos = rec.pos + rlen as i64 - 1;
+        prev_is_insert_for_overlap = len_diff > 0;
     }
 
     if patches.is_empty() {
         if let Some(absent) = opts.absent_allele {
-            return Some((
+            return Ok(Some((
                 ApplyState::new(ori_pos, vec![absent; base_ref.len()]).with_chr(chr),
                 FastPathLane::SameLenOnly,
-            ));
+            )));
         }
-        return None;
+        return Ok(Some((
+            ApplyState::new(ori_pos, base_ref.to_vec()).with_chr(chr),
+            FastPathLane::SameLenOnly,
+        )));
     }
     let final_len = base_ref.len() as i64 + total_delta;
     if final_len < 0 {
-        return None;
+        return Err(FallbackReason::LengthChangingEdit);
     }
 
     let mut out = Vec::with_capacity(final_len as usize);
@@ -1157,7 +1486,7 @@ fn try_apply_edit_script_region(
     let mut cursor_check = 0usize;
     for patch in &patches {
         if patch.idx < cursor_check || patch.idx + patch.rlen > base_ref.len() {
-            return None;
+            return Err(FallbackReason::VariantOverlap);
         }
         cursor_check = patch.idx + patch.rlen;
     }
@@ -1208,8 +1537,8 @@ fn try_apply_edit_script_region(
     state.prev_base_pos = prev_base_pos;
     state.prev_is_insert = prev_is_insert;
     state.case = last_case;
-    state.napplied = patches.iter().filter(|p| p.count_applied).count() as u64;
-    Some((state, lane))
+    state.napplied = patches.iter().map(|p| p.applied_count).sum();
+    Ok(Some((state, lane)))
 }
 
 fn try_apply_edit_script_plain_apply_all_alt(
@@ -1218,6 +1547,9 @@ fn try_apply_edit_script_plain_apply_all_alt(
     ori_pos: i64,
     records: &RecordSet<'_>,
 ) -> Option<(ApplyState, FastPathLane)> {
+    if edit_script_fastpath_disabled() {
+        return None;
+    }
     let mut patches: Vec<PlainEditRecord<'_>> = Vec::with_capacity(records.len());
     let mut frz_pos = -1i64;
     let mut total_delta = 0i64;
@@ -1420,7 +1752,9 @@ pub fn apply_absent(state: &mut ApplyState, pos: i64, absent: u8) {
     // bcftools: ie = (pos && pos-ori+off < blen) ? pos-ori+off : blen
     // Use saturating arithmetic: pos can be HTS_POS_MAX (i64::MAX) as a sentinel
     // for the region-end fill, in which case ie must clamp to blen.
-    let cand = (pos - state.ori_pos).saturating_add(state.mod_off);
+    let cand = pos
+        .saturating_sub(state.ori_pos)
+        .saturating_add(state.mod_off);
     let ie = if pos != 0 && cand < blen { cand } else { blen };
     let ib = if state.frz_mod < 0 { 0 } else { state.frz_mod };
     if ib < 0 || ie <= ib {
@@ -1436,11 +1770,22 @@ pub fn apply_absent(state: &mut ApplyState, pos: i64, absent: u8) {
 // ---------------------------------------------------------------------------
 
 fn freeze_ref(state: &mut ApplyState, rec: &VcfRecord) {
-    if state.frz_pos >= rec.pos + rec.rlen as i64 - 1 {
+    freeze_ref_span(state, rec.pos, rec.rlen as i64);
+}
+
+fn freeze_ref_span(state: &mut ApplyState, pos: i64, rlen: i64) {
+    assert!(
+        rlen >= 0,
+        "consensus apply invariant violated: negative freeze rlen={rlen} pos={pos}"
+    );
+    if rlen == 0 {
         return;
     }
-    state.frz_pos = rec.pos + rec.rlen as i64 - 1;
-    state.frz_mod = rec.pos - state.ori_pos + state.mod_off + rec.rlen as i64;
+    if state.frz_pos >= pos + rlen - 1 {
+        return;
+    }
+    state.frz_pos = pos + rlen - 1;
+    state.frz_mod = pos - state.ori_pos + state.mod_off + rlen;
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,7 +1836,7 @@ pub fn apply_variant(
     // 766-788: missing allele (ialt == -1) — single pos or gvcf block.
     if ialt == -1 {
         if let Some(mchar) = opts.missing_allele {
-            apply_missing(state, rec, mchar);
+            apply_missing(state, rec, mchar, opts.mark_snv);
         }
         return;
     }
@@ -1503,13 +1848,23 @@ pub fn apply_variant(
         }
         return;
     }
-    // Note: ialt==0 (REF selected) is NOT a return — bcftools applies REF
-    // through the normal path (a no-op replacement that still updates frz_pos),
-    // and the overlap trim below (consensus.c:811-825) may move it forward.
+    // In the single-sample branch bcftools returns immediately for a selected
+    // REF allele. With -a it only freezes the REF span; without -a it must not
+    // advance fa_frz_pos, otherwise a long hom-ref record can mask a later ALT.
+    if ialt == 0 && selected_ref_short_circuits(opts) {
+        if opts.absent_allele.is_some() {
+            freeze_ref(state, rec);
+        }
+        return;
+    }
     let ialt_u = ialt as usize;
     if ialt_u >= rec.alleles.len() {
-        // broken VCF (too few alts); bcftools errors. Skip defensively.
-        return;
+        panic!(
+            "Broken VCF, too few alts at pos={}: ialt={} n_alleles={}",
+            rec.pos + 1,
+            ialt,
+            rec.alleles.len()
+        );
     }
 
     if chain.is_none()
@@ -1571,8 +1926,12 @@ pub fn apply_variant(
         let ntrim = state.frz_pos - pos + 1;
         let nref = ref_orig.len() as i64 - ref_off;
         if ntrim >= nref {
-            // bcftools errors (unnormalized VCF); skip defensively.
-            return;
+            panic!(
+                "failed to trim overlapping variant at pos={}, ntrim={} >= nref={}. Is the VCF normalized?",
+                pos + 1,
+                ntrim,
+                nref
+            );
         }
         pos += ntrim;
         rlen -= ntrim;
@@ -1609,7 +1968,10 @@ pub fn apply_variant(
             rlen += idx;
             ref_off -= idx; // -= idx (idx<0) → advances forward
             alt_off -= idx;
-            alt_len = alt_buf.len() as i64 - alt_off; // recompute strlen
+            // Keep `alt_len` as an exclusive end offset. The C implementation
+            // advances the allele pointer and recomputes strlen(); in this
+            // offset representation that means moving `alt_off` only.
+            alt_len = alt_buf.len() as i64;
             idx = 0;
         } else {
             // ref overlaps fa but alt does not: trim to leave one base before
@@ -1617,8 +1979,14 @@ pub fn apply_variant(
             rlen += idx + 1;
             ref_off -= idx + 1;
             // alt_allele += strlen(alt_allele)-1  → point to last char
-            alt_off = alt_off + alt_len - 1;
-            alt_len = 1;
+            let remaining_alt = alt_len - alt_off;
+            assert!(
+                remaining_alt > 0,
+                "consensus apply invariant violated: non-positive remaining_alt={remaining_alt} \
+                 pos={pos} idx={idx} alt_off={alt_off} alt_len={alt_len} alt_buf_len={}",
+                alt_buf.len()
+            );
+            alt_off += remaining_alt - 1;
             idx = -1;
         }
     }
@@ -1645,11 +2013,14 @@ pub fn apply_variant(
     let mut alen: i64;
     if alt_buf.starts_with(b"<") {
         // bcftools (consensus.c:899): only <DEL>, <*>, <NON_REF> are supported.
-        // Any other symbolic allele (<INS>, <DUP>, ...) → bcftools errors; we
-        // skip defensively. Note <INS> sets trim_beg above (line 808) but is
-        // still rejected here, matching bcftools.
+        // Any other symbolic allele (<INS>, <DUP>, ...) errors. Note <INS>
+        // sets trim_beg above (line 808) but is still rejected here.
         if !alt_is_symbolic_del && !is_gvcf {
-            return;
+            panic!(
+                "Symbolic alleles other than <DEL>, <*> or <NON_REF> are currently not supported, e.g. \"{}\" at pos={}",
+                String::from_utf8_lossy(&alt_buf),
+                pos + 1
+            );
         }
         if alt_is_symbolic_del {
             if opts.mark_del.is_some() {
@@ -1669,26 +2040,20 @@ pub fn apply_variant(
             }
         } else {
             // <*> or <NON_REF> — gVCF reference block: freeze and skip
-            freeze_ref(state, rec);
+            freeze_ref_span(state, pos, rlen);
             return;
         }
     } else if idx >= 0 && !ref_matches(state, idx, ref_orig, ref_off, rlen) {
         // 925-965: REF mismatch with the fa buffer — prev_base fallback or error
         let fail = ref_mismatch_fallback_ok(state, pos, rlen, ref_orig, ref_off, idx);
         if !fail {
-            // bcftools errors here. We surface an error by skipping (M2).
-            return;
+            fail_ref_mismatch(pos, ref_orig, ref_off);
         }
         alen = alt_len - alt_off;
         len_diff = alen - rlen;
         if opts.mark_del.is_some() && len_diff < 0 {
-            alt_buf = mark_del_bytes(
-                ref_orig,
-                ref_off,
-                rlen,
-                Some(&alt_buf[alt_off as usize..alt_off as usize + alt_len as usize]),
-                opts.mark_del,
-            );
+            let alt_view = checked_alt_effective_slice(&alt_buf, alt_off, alt_len);
+            alt_buf = mark_del_bytes(ref_orig, ref_off, rlen, Some(alt_view), opts.mark_del);
             alt_off = 0;
             alt_len = rlen;
             alen = rlen;
@@ -1699,19 +2064,24 @@ pub fn apply_variant(
         alen = alt_len - alt_off;
         len_diff = alen - rlen;
         if opts.mark_del.is_some() && len_diff < 0 {
-            alt_buf = mark_del_bytes(
-                ref_orig,
-                ref_off,
-                rlen,
-                Some(&alt_buf[alt_off as usize..alt_off as usize + alt_len as usize]),
-                opts.mark_del,
-            );
+            let alt_view = checked_alt_effective_slice(&alt_buf, alt_off, alt_len);
+            alt_buf = mark_del_bytes(ref_orig, ref_off, rlen, Some(alt_view), opts.mark_del);
             alt_off = 0;
             alt_len = rlen;
             alen = rlen;
             len_diff = 0;
         }
     }
+
+    assert!(
+        (alen | rlen) >= 0
+            && i64_range_within(alt_off, alt_len, alt_buf.len() as i64)
+            && !state.buf.is_empty(),
+        "consensus apply invariant violated: pos={pos} idx={idx} rlen={rlen} alen={alen} \
+         alt_off={alt_off} alt_len={alt_len} alt_buf_len={} state_buf_len={}",
+        alt_buf.len(),
+        state.buf.len()
+    );
 
     // 992-996: case sync
     let safe_idx = if idx < 0 { 0 } else { idx as usize };
@@ -1842,20 +2212,85 @@ pub fn apply_variant(
 /// is overwritten; otherwise a single position. bcftools achieves this by
 /// rewriting alleles to `REF,missing_char` and setting ialt=1; we inline the
 /// same buffer effect.
-fn apply_missing(state: &mut ApplyState, rec: &VcfRecord, mchar: u8) {
-    let idx = rec.pos - state.ori_pos + state.mod_off;
-    if idx < 0 || idx as usize >= state.buf.len() {
+fn apply_missing(state: &mut ApplyState, rec: &VcfRecord, mchar: u8, mark_snv: Option<u8>) {
+    assert!(
+        rec.rlen >= 0,
+        "consensus apply invariant violated: negative missing rlen={} pos={}",
+        rec.rlen,
+        rec.pos
+    );
+    if state.buf.is_empty() {
         return;
     }
-    let rlen = rec.rlen as usize;
-    let end = ((idx as usize) + rlen).min(state.buf.len());
-    state.buf[idx as usize..end].fill(mchar);
-    // freeze so subsequent absent fill / overlap checks see this position done
-    state.frz_pos = rec.pos + rec.rlen as i64 - 1;
-    state.frz_mod = idx + (end - idx as usize) as i64;
-    state.prev_base = mchar;
-    state.prev_base_pos = rec.pos + rec.rlen as i64 - 1;
+
+    let mut pos = rec.pos;
+    let mut rlen = if rec.rlen > 1 && rec.var_type == VCF_REF {
+        rec.rlen as i64
+    } else {
+        1
+    };
+    let mut idx = pos - state.ori_pos + state.mod_off;
+
+    if pos <= state.frz_pos {
+        return;
+    }
+    if idx < 0 {
+        if rlen <= -idx {
+            return;
+        }
+        pos -= idx;
+        rlen += idx;
+        idx = 0;
+    }
+
+    let blen = state.buf.len() as i64;
+    if idx > 0 && idx >= blen {
+        return;
+    }
+    if rlen > blen - idx {
+        rlen = blen - idx;
+    }
+    if rlen <= 0 {
+        return;
+    }
+
+    let idx_usize = idx as usize;
+    let rlen_usize = rlen as usize;
+    let end = idx_usize + rlen_usize;
+
+    let ref_bases = if rec.rlen > 1 && rec.var_type == VCF_REF {
+        AlleleBuf::from_slice(&state.buf[idx_usize..end])
+    } else {
+        let ref_base = rec
+            .alleles
+            .first()
+            .and_then(|a| a.first())
+            .copied()
+            .unwrap_or(0);
+        if !ascii_eq_ignore_case(state.buf[idx_usize], ref_base)
+            && !ref_mismatch_fallback_ok(state, pos, rlen, &[ref_base], 0, idx)
+        {
+            fail_ref_mismatch(pos, &[ref_base], 0);
+        }
+        AlleleBuf::from_slice(&[ref_base])
+    };
+
+    let first_base = state.buf[idx_usize];
+    let last_base = state.buf[end - 1];
+    let to_upper = first_base.is_ascii_uppercase();
+    state.case = if to_upper { TO_UPPER } else { TO_LOWER };
+    let mut missing = repeated_allele_byte(rlen_usize, mchar);
+    apply_case_to_alt(&mut missing, to_upper);
+    if let Some(mark) = mark_snv {
+        mark_snv_bytes(&ref_bases, 0, &mut missing, 0, rlen, mark);
+    }
+    state.buf[idx_usize..end].copy_from_slice(&missing);
+
+    state.prev_base = last_base;
+    state.prev_base_pos = pos + rlen - 1;
     state.prev_is_insert = false;
+    state.frz_mod = idx + rlen;
+    state.frz_pos = pos + rlen - 1;
     state.napplied += 1;
 }
 
@@ -1877,6 +2312,27 @@ fn alt_first(alt_buf: &[u8], alt_off: i64) -> u8 {
     }
 }
 
+fn checked_alt_effective_slice(alt_buf: &[u8], alt_off: i64, alt_len: i64) -> &[u8] {
+    assert!(
+        i64_range_within(alt_off, alt_len, alt_buf.len() as i64),
+        "consensus apply invariant violated: alt_off={alt_off} alt_len={alt_len} alt_buf_len={}",
+        alt_buf.len()
+    );
+    &alt_buf[alt_off as usize..alt_len as usize]
+}
+
+#[cold]
+#[inline(never)]
+fn fail_ref_mismatch(pos: i64, ref_allele: &[u8], ref_off: i64) -> ! {
+    let start = ref_off.max(0) as usize;
+    let ref_view = ref_allele.get(start..).unwrap_or(&[]);
+    panic!(
+        "The fasta sequence does not match the REF allele at pos={}: REF={}",
+        pos + 1,
+        String::from_utf8_lossy(ref_view)
+    );
+}
+
 fn try_apply_same_len_allele(
     rec: &VcfRecord,
     ialt: usize,
@@ -1884,6 +2340,9 @@ fn try_apply_same_len_allele(
     state: &mut ApplyState,
     opts: &ApplyOptions,
 ) -> bool {
+    if same_len_fastpath_disabled() {
+        return false;
+    }
     if rec.rlen <= 0 {
         return false;
     }
@@ -1933,7 +2392,7 @@ fn try_apply_same_len_allele(
     if !state.buf[idx..idx + rlen].eq_ignore_ascii_case(ref_allele)
         && !ref_mismatch_fallback_ok(state, pos, rec.rlen as i64, ref_allele, 0, idx as i64)
     {
-        return true;
+        fail_ref_mismatch(pos, ref_allele, 0);
     }
 
     let first_base = state.buf[idx];
@@ -2141,6 +2600,12 @@ fn mark_ins_bytes(
     alen: i64,
     mark: u8,
 ) {
+    assert!(
+        ref_off >= 0 && i64_offset_len_within(alt_off, alen, alt_buf.len() as i64),
+        "consensus apply invariant violated: mark_ins ref_off={ref_off} alt_off={alt_off} \
+         alen={alen} alt_buf_len={}",
+        alt_buf.len()
+    );
     let nref = (ref_allele.len() as i64 - ref_off).max(0);
     let start = (alt_off + nref) as usize;
     let end = (alt_off + alen) as usize;
@@ -2173,6 +2638,12 @@ fn mark_snv_bytes(
     alen: i64,
     mark: u8,
 ) {
+    assert!(
+        ref_off >= 0 && i64_offset_len_within(alt_off, alen, alt_buf.len() as i64),
+        "consensus apply invariant violated: mark_snv ref_off={ref_off} alt_off={alt_off} \
+         alen={alen} alt_buf_len={}",
+        alt_buf.len()
+    );
     let nref = (ref_allele.len() as i64 - ref_off).max(0);
     let n = nref.min(alen) as usize;
     let rstart = ref_off as usize;
@@ -2203,6 +2674,10 @@ fn mark_snv_bytes(
 
 /// `strncasecmp(ref_allele, fa_buf+idx, rlen)` (consensus.c:925)
 fn ref_matches(state: &ApplyState, idx: i64, ref_allele: &[u8], ref_off: i64, rlen: i64) -> bool {
+    assert!(
+        nonnegative3(idx, ref_off, rlen),
+        "consensus apply invariant violated: ref_matches idx={idx} ref_off={ref_off} rlen={rlen}"
+    );
     let start = idx as usize;
     if start + rlen as usize > state.buf.len() {
         return false;
@@ -2230,6 +2705,10 @@ fn ref_mismatch_fallback_ok(
     ref_off: i64,
     idx: i64,
 ) -> bool {
+    assert!(
+        nonnegative3(idx, ref_off, rlen),
+        "consensus apply invariant violated: ref_mismatch_fallback idx={idx} ref_off={ref_off} rlen={rlen}"
+    );
     if state.prev_base_pos != pos {
         return false;
     }
@@ -2259,6 +2738,10 @@ fn mark_del_bytes(
     alt: Option<&[u8]>,
     mark: Option<u8>,
 ) -> AlleleBuf {
+    assert!(
+        (ref_off | rlen) >= 0,
+        "consensus apply invariant violated: mark_del ref_off={ref_off} rlen={rlen}"
+    );
     let mark = match mark {
         Some(m) => m,
         None => return AlleleBuf::new(),
@@ -2302,6 +2785,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let vcf = dir.join("t.vcf");
         let header = "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=1000>\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
+        std::fs::write(&vcf, format!("{}{}", header, body)).unwrap();
+        vcf
+    }
+
+    fn write_vcf_gt_with_end(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_apply_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vcf = dir.join("t.vcf");
+        let header = "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=1000>\n\
+            ##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position\">\n\
             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n";
         std::fs::write(&vcf, format!("{}{}", header, body)).unwrap();
@@ -2400,6 +2896,65 @@ mod tests {
     }
 
     #[test]
+    fn env_force_fallback_state_machine_forces_stats_fallback_when_enabled() {
+        if !force_fallback_state_machine() {
+            return;
+        }
+        let vcf = write_vcf("env_force_fallback", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AGGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::FallbackStateMachine), 1);
+        assert_eq!(stats.same_len_fastpath_records, 0);
+        assert_eq!(stats.edit_script_fastpath_records, 0);
+    }
+
+    #[test]
+    fn env_disable_same_len_fastpath_routes_same_len_to_edit_when_enabled() {
+        if std::env::var_os("PYCONSENSUS_DISABLE_SAME_LEN_FASTPATH").is_none()
+            || force_fallback_state_machine()
+        {
+            return;
+        }
+        let vcf = write_vcf("env_disable_same_len", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"AGGTACGT");
+        assert_eq!(stats.same_len_fastpath_records, 0);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+    }
+
+    #[test]
+    fn env_disable_edit_script_fastpath_routes_edit_to_fallback_when_enabled() {
+        if std::env::var_os("PYCONSENSUS_DISABLE_EDIT_FASTPATH").is_none()
+            || force_fallback_state_machine()
+        {
+            return;
+        }
+        let vcf = write_vcf("env_disable_edit_script", "chr1\t2\t.\tC\tCAA\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACAAGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::FallbackStateMachine), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 0);
+    }
+
+    #[test]
     fn select_fastpath_allele_reads_biallelic_hap_bitset_directly() {
         let vcf = write_vcf_gt("fast_select_bitset", "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t0|1\n");
         let store = VcfStore::load(&vcf).unwrap();
@@ -2477,6 +3032,26 @@ mod tests {
         assert_eq!(stats.records_seen, 2);
         assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
         assert_eq!(stats.same_len_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn stats_entry_reports_same_len_iupac_lane() {
+        let vcf = write_vcf("same_len_iupac_stats", "chr1\t2\t.\tC\tG\t.\t.\t.\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: SampleMode::IupacFromRefAlt,
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ASGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 0);
+        assert_eq!(stats.lane_count(FastPathLane::SameLenIupac), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
         assert_eq!(stats.fallback_records, 0);
     }
 
@@ -2708,6 +3283,115 @@ mod tests {
     }
 
     #[test]
+    fn same_len_fastpath_missing_mnp_matches_fallback_anchor_only_with_absent() {
+        let vcf = write_vcf_gt(
+            "same_len_missing_mnp_absent",
+            "chr1\t2\t.\tCG\tTT\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            absent_allele: Some(b'N'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let fast = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fast.buf, b"N?NNNNNN");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.frz_pos, fallback.frz_pos);
+        assert_eq!(fast.frz_mod, fallback.frz_mod);
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn same_len_fastpath_missing_gvcf_ref_block_matches_fallback() {
+        let vcf = write_vcf_gt_with_end(
+            "same_len_missing_gvcf_fast",
+            "chr1\t4\t.\tT\t<NON_REF>\t.\t.\tEND=6\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let fast = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fast.buf, b"ACG???GT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.frz_pos, fallback.frz_pos);
+        assert_eq!(fast.frz_mod, fallback.frz_mod);
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn same_len_fastpath_missing_respects_case_and_mark_snv() {
+        let vcf = write_vcf_gt(
+            "same_len_missing_case_mark",
+            "chr1\t4\t.\tT\tG\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'n'),
+            mark_snv: Some(b'#'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state =
+            apply_region_with_stats("chr1", b"acgtacgt".to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"acg#acgt");
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.same_len_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
     fn stats_entry_uses_empty_region_lane() {
         let opts = ApplyOptions::default();
         let mut stats = RuntimeStats::default();
@@ -2842,6 +3526,25 @@ mod tests {
     }
 
     #[test]
+    fn edit_script_fastpath_handles_symbolic_del() {
+        let vcf = write_vcf(
+            "edit_script_symbolic_del",
+            "chr1\t4\t.\tTAC\t<DEL>\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACGTGT");
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
     fn edit_script_fastpath_handles_missing_char() {
         let vcf = write_vcf_gt(
             "edit_script_missing",
@@ -2866,6 +3569,532 @@ mod tests {
         assert_eq!(stats.lane_count(FastPathLane::MixedSimpleEdits), 1);
         assert_eq!(stats.edit_script_fastpath_records, 2);
         assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_missing_mnp_matches_fallback_anchor_only() {
+        let vcf = write_vcf_gt(
+            "edit_script_missing_mnp",
+            "chr1\t2\t.\tCG\tTT\t.\t.\t.\tGT\t./.\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let fast = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fast.buf, b"A?GTAT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.frz_pos, fallback.frz_pos);
+        assert_eq!(fast.frz_mod, fallback.frz_mod);
+        assert_eq!(stats.lane_count(FastPathLane::MixedSimpleEdits), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn fallback_missing_indel_replaces_anchor_base_only() {
+        let vcf = write_vcf_gt(
+            "fallback_missing_indel_anchor",
+            "chr1\t4\t.\tTAC\tT\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACG?ACGT");
+        assert_eq!(state.napplied, 1);
+        assert_eq!(state.frz_pos, 3);
+    }
+
+    #[test]
+    fn fallback_missing_gvcf_ref_block_replaces_entire_block() {
+        let vcf = write_vcf_gt_with_end(
+            "fallback_missing_gvcf_block",
+            "chr1\t4\t.\tT\t<NON_REF>\t.\t.\tEND=6\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACG???GT");
+        assert_eq!(state.napplied, 1);
+        assert_eq!(state.frz_pos, 5);
+    }
+
+    #[test]
+    fn fallback_missing_respects_case_and_mark_snv() {
+        let vcf = write_vcf_gt(
+            "fallback_missing_case_mark",
+            "chr1\t4\t.\tT\tG\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'n'),
+            mark_snv: Some(b'#'),
+            ..Default::default()
+        };
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            b"acgtacgt".to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"acg#acgt");
+    }
+
+    #[test]
+    fn fallback_missing_overlap_is_skipped_like_state_machine() {
+        let vcf = write_vcf_gt(
+            "fallback_missing_overlap_skip",
+            "chr1\t4\t.\tT\tG\t.\t.\t.\tGT\t1|1\n\
+             chr1\t4\t.\tT\tC\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACGGACGT");
+        assert_eq!(state.napplied, 1);
+    }
+
+    #[test]
+    fn fallback_symbolic_gvcf_freezes_clipped_span_at_region_start() {
+        let full = b"ACGTACGTACGTACGTACGT";
+        let vcf = write_vcf_gt_with_end(
+            "fallback_gvcf_freeze_region_start",
+            "chr1\t1\t.\tA\t<NON_REF>\t.\t.\tEND=20\tGT\t0/1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 5, 9, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::SymbolicAllele, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            full[5..10].to_vec(),
+            5,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, &full[5..10]);
+        assert_eq!(state.frz_pos, 9);
+        assert_eq!(state.frz_mod, 5);
+        assert_eq!(state.napplied, 0);
+    }
+
+    #[test]
+    fn fallback_symbolic_gvcf_freezes_clipped_span_at_region_end() {
+        let full = b"ACGTACGTACGTACGTACGT";
+        let vcf = write_vcf_gt_with_end(
+            "fallback_gvcf_freeze_region_end",
+            "chr1\t4\t.\tT\t<NON_REF>\t.\t.\tEND=20\tGT\t0/1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 3, 7, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::SymbolicAllele, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            full[3..8].to_vec(),
+            3,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, &full[3..8]);
+        assert_eq!(state.frz_pos, 7);
+        assert_eq!(state.frz_mod, 5);
+        assert_eq!(state.napplied, 0);
+    }
+
+    #[test]
+    fn fallback_allows_insertion_after_deletion_at_frozen_base() {
+        let vcf = write_vcf(
+            "fallback_insert_after_delete",
+            "chr1\t2\t.\tCG\tC\t.\t.\t.\n\
+             chr1\t3\t.\tG\tGAA\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::VariantOverlap, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACAATACGT");
+        assert_eq!(state.napplied, 2);
+        assert_eq!(state.frz_pos, 2);
+    }
+
+    #[test]
+    fn fallback_skips_insertion_after_insertion_overlap() {
+        let vcf = write_vcf(
+            "fallback_insert_after_insert_skip",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\n\
+             chr1\t2\t.\tC\tCTT\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::VariantOverlap, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACAAGTACGT");
+        assert_eq!(state.napplied, 1);
+        assert_eq!(state.frz_pos, 1);
+    }
+
+    #[test]
+    fn fallback_truncates_variant_crossing_region_end() {
+        let vcf = write_vcf(
+            "fallback_crosses_region_end",
+            "chr1\t4\t.\tTACGT\tTGGGG\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 4, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let state = apply_region_planned(
+            "chr1",
+            REF[..5].to_vec(),
+            0,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(state.buf, b"ACGTG");
+        assert_eq!(state.napplied, 1);
+        assert_eq!(state.frz_pos, 4);
+        assert_eq!(state.frz_mod, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "The fasta sequence does not match")]
+    fn fallback_same_len_ref_mismatch_errors_like_bcftools() {
+        let vcf = write_vcf(
+            "fallback_same_len_ref_mismatch",
+            "chr1\t2\t.\tT\tG\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let _ = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &ApplyOptions::default(),
+            None,
+            Some(&fallback_plan),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "The fasta sequence does not match")]
+    fn fallback_missing_ref_mismatch_errors_like_bcftools() {
+        let vcf = write_vcf_gt(
+            "fallback_missing_ref_mismatch",
+            "chr1\t2\t.\tT\tG\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            missing_allele: Some(b'?'),
+            ..Default::default()
+        };
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+
+        let _ = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+    }
+
+    #[test]
+    fn edit_script_fastpath_handles_length_changing_iupac_override() {
+        let vcf = write_vcf_gt(
+            "edit_script_iupac_indel",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\tGT\t0/1\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\tGT\t0/1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1pIu").unwrap(),
+            },
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACAAGTAT");
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 2);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_skips_all_missing_without_fallback() {
+        let vcf = write_vcf_gt(
+            "edit_script_all_missing_skip",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\tGT\t./.\n\
+             chr1\t5\t.\tACG\tA\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, REF);
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_skips_selected_ref_mismatch_without_fallback() {
+        let vcf = write_vcf_gt(
+            "edit_script_ref_mismatch_ref_selected",
+            "chr1\t2\t.\tT\tG\t.\t.\t.\tGT\t0/0\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            ..Default::default()
+        };
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, REF);
+        assert_eq!(stats.lane_count(FastPathLane::SameLenOnly), 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn selected_ref_record_does_not_freeze_later_alt_deletion() {
+        let full = b"ACGTACGTACGTACGTACGT";
+        let vcf = write_vcf_gt(
+            "selected_ref_does_not_freeze_deletion",
+            "chr1\t5\t.\tACGTACGTAC\tA\t.\t.\t.\tGT\t0|0\n\
+             chr1\t8\t.\tTACGTACG\tT\t.\t.\t.\tGT\t0|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, full.len() as i64 - 1, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("2pIu").unwrap(),
+            },
+            ..Default::default()
+        };
+
+        let mut stats = RuntimeStats::default();
+        let fast = apply_region_with_stats("chr1", full.to_vec(), 0, &recs, &opts, &mut stats);
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            full.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fast.buf, b"ACGTACGTTACGT");
+        assert_eq!(fallback.buf, fast.buf);
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_skips_state_machine_overlap() {
+        let vcf = write_vcf(
+            "edit_script_overlap_skip",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\n\
+             chr1\t2\t.\tC\tCGG\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACAAGTACGT");
+        assert_eq!(stats.lane_count(FastPathLane::NormalizedEditScript), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
+    fn edit_script_fastpath_falls_back_for_same_anchor_overlap() {
+        let vcf = write_vcf(
+            "edit_script_same_anchor_overlap_merge",
+            "chr1\t2\t.\tCG\tC\t.\t.\t.\n\
+             chr1\t3\t.\tG\tGAA\t.\t.\t.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions::default();
+        let mut stats = RuntimeStats::default();
+
+        let state = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        assert_eq!(state.buf, b"ACAATACGT");
+        assert_eq!(stats.lane_count(FastPathLane::FallbackStateMachine), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 0);
+        assert_eq!(stats.fallback_records, 2);
+        assert_eq!(
+            stats.fallback_reason_count(FallbackReason::VariantOverlap),
+            1
+        );
     }
 
     #[test]
@@ -2918,6 +4147,173 @@ mod tests {
     }
 
     #[test]
+    fn edit_script_fastpath_skips_single_sample_selected_ref_spanning_region_start() {
+        let full = b"ACGTACGTACGTACGT";
+        let vcf = write_vcf_gt(
+            "edit_script_selected_ref_spans_region_start",
+            "chr1\t1\t.\tACGTACGTAC\tA\t.\t.\t.\tGT\t0|0\n\
+             chr1\t8\t.\tT\tG\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 5, 15, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            ..Default::default()
+        };
+
+        let plan = crate::planner::plan_region(&recs, PlanOptions::default());
+        let fast = apply_region_planned(
+            "chr1",
+            full[5..16].to_vec(),
+            5,
+            &recs,
+            &opts,
+            None,
+            Some(&plan),
+        );
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            full[5..16].to_vec(),
+            5,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fallback.buf, b"CGGACGTACGT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.fallback_reason, None);
+    }
+
+    #[test]
+    fn edit_script_fastpath_skips_single_sample_selected_ref_spanning_region_end() {
+        let full = b"ACGTACGTACGTACGT";
+        let vcf = write_vcf_gt(
+            "edit_script_selected_ref_spans_region_end",
+            "chr1\t4\t.\tTACGTAC\tT\t.\t.\t.\tGT\t0|0\n\
+             chr1\t6\t.\tC\tG\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::SingleSample {
+                idx: 0,
+                spec: crate::haplotype::HaplotypeSpec::parse("1").unwrap(),
+            },
+            ..Default::default()
+        };
+
+        let plan = crate::planner::plan_region(&recs, PlanOptions::default());
+        let fast = apply_region_planned(
+            "chr1",
+            full[..8].to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&plan),
+        );
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            full[..8].to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fallback.buf, b"ACGTAGGT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.fallback_reason, None);
+    }
+
+    #[test]
+    fn edit_script_fastpath_falls_back_for_iupac_selected_ref_extending_overlap() {
+        let vcf = write_vcf_gt(
+            "edit_script_iupac_selected_ref_extending_overlap",
+            "chr1\t2\t.\tCGT\tC\t.\t.\t.\tGT\t1|1\n\
+             chr1\t4\t.\tTAC\tT\t.\t.\t.\tGT\t0|0\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::IupacAllSamples { samples: vec![0] },
+            ..Default::default()
+        };
+
+        let plan = crate::planner::plan_region(&recs, PlanOptions::default());
+        let fast = apply_region_planned("chr1", REF.to_vec(), 0, &recs, &opts, None, Some(&plan));
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fallback.buf, b"ACACGT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.napplied, fallback.napplied);
+        assert_eq!(fast.frz_pos, fallback.frz_pos);
+        assert_eq!(fast.frz_mod, fallback.frz_mod);
+        assert_eq!(fast.fallback_reason, Some(FallbackReason::VariantOverlap));
+    }
+
+    #[test]
+    fn edit_script_fastpath_keeps_prev_insert_after_covered_iupac_selected_ref() {
+        let vcf = write_vcf_gt(
+            "edit_script_iupac_selected_ref_keeps_prev_insert",
+            "chr1\t2\t.\tC\tCAA\t.\t.\t.\tGT\t1|1\n\
+             chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t0|0\n\
+             chr1\t2\t.\tC\tCTT\t.\t.\t.\tGT\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let recs = store.query("chr1", 0, 7, 1);
+        let opts = ApplyOptions {
+            sample_mode: crate::haplotype::SampleMode::IupacAllSamples { samples: vec![0] },
+            ..Default::default()
+        };
+
+        let mut stats = RuntimeStats::default();
+        let fast = apply_region_with_stats("chr1", REF.to_vec(), 0, &recs, &opts, &mut stats);
+
+        let fallback_plan =
+            crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
+        let fallback = apply_region_planned(
+            "chr1",
+            REF.to_vec(),
+            0,
+            &recs,
+            &opts,
+            None,
+            Some(&fallback_plan),
+        );
+
+        assert_eq!(fallback.buf, b"ACAAGTACGT");
+        assert_eq!(fast.buf, fallback.buf);
+        assert_eq!(fast.fallback_reason, None);
+        assert_eq!(stats.lane_count(FastPathLane::MixedSimpleEdits), 1);
+        assert_eq!(stats.edit_script_fastpath_records, 1);
+        assert_eq!(stats.fallback_records, 0);
+    }
+
+    #[test]
     fn pure_insertion_grows_buffer() {
         // 0-based pos 3, REF=T ALT=TGGG -> insert "GGG" after T (anchor T kept)
         let vcf = write_vcf("ins", "chr1\t4\t.\tT\tTGGG\t.\t.\t.\n");
@@ -2931,6 +4327,34 @@ mod tests {
         let vcf = write_vcf("del", "chr1\t4\t.\tTAC\tT\t.\t.\t.\n");
         let out = apply_all(&vcf, REF, 0, 7);
         assert_eq!(out, b"ACGTGT");
+    }
+
+    #[test]
+    fn deletion_starting_before_region_trims_alt_to_last_base() {
+        let full = b"ACGTACGTACGTACGTACGT";
+        // chr1:2-13 deletes through the beginning of the requested region
+        // chr1:10-20. The ALT anchor is entirely before the region, so the
+        // in-region output starts after the deleted span at chr1:14.
+        let vcf = write_vcf(
+            "del_starts_before_region",
+            "chr1\t2\t.\tCGTACGTACGTA\tC\t.\t.\t.\n",
+        );
+        let out = apply_all(&vcf, &full[9..20], 9, 19);
+        assert_eq!(out, b"CGTACGT");
+    }
+
+    #[test]
+    fn deletion_starting_before_region_with_alt_overlap_keeps_positive_alen() {
+        let full = "A".repeat(40);
+        let ref_allele = "A".repeat(32);
+        let alt_allele = "A".repeat(14);
+        // Region starts 8 bp into the record, so the ALT still overlaps the
+        // region. The old offset model set alt_len to 14 - 8, then computed
+        // alen = alt_len - alt_off = -2 and cast that to usize.
+        let body = format!("chr1\t1\t.\t{}\t{}\t.\t.\t.\n", ref_allele, alt_allele);
+        let vcf = write_vcf("del_starts_before_region_alt_overlap", &body);
+        let out = apply_all(&vcf, &full.as_bytes()[8..40], 8, 39);
+        assert_eq!(out, vec![b'A'; 14]);
     }
 
     #[test]

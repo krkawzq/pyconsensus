@@ -24,10 +24,13 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const CVCF_MAGIC: &[u8; 8] = b"CVCF0001";
-const CVCF_VERSION: u32 = 7;
+const CVCF_VERSION: u32 = 13;
+const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceFingerprint {
+    path_hash: u64,
     len: u64,
     mtime_secs: i64,
     mtime_nanos: u32,
@@ -129,7 +132,9 @@ pub struct BiallelicPhasedGtBits {
     n_samples: usize,
     hap1_alt: Vec<u64>,
     hap2_alt: Vec<u64>,
-    missing: Vec<u64>,
+    hap1_missing: Vec<u64>,
+    hap2_missing: Vec<u64>,
+    fallback: Vec<u64>,
 }
 
 impl BiallelicPhasedGtBits {
@@ -146,32 +151,49 @@ impl BiallelicPhasedGtBits {
             n_samples,
             hap1_alt: vec![0; n_words],
             hap2_alt: vec![0; n_words],
-            missing: vec![0; n_words],
+            hap1_missing: vec![0; n_words],
+            hap2_missing: vec![0; n_words],
+            fallback: vec![0; n_words],
         };
         for (sample, sample_gt) in gt.iter().enumerate() {
-            if sample_gt.len() != 2 {
-                return None;
-            }
             let word = sample / 64;
             let bit = 1u64 << (sample & 63);
+            if sample_gt.len() == 1 && sample_gt[0].allele.is_none() {
+                bits.hap1_missing[word] |= bit;
+                bits.hap2_missing[word] |= bit;
+                continue;
+            }
+            if sample_gt.len() != 2 {
+                bits.fallback[word] |= bit;
+                continue;
+            }
             let a0 = &sample_gt[0];
             let a1 = &sample_gt[1];
-            let Some(h1) = a0.allele else {
-                bits.missing[word] |= bit;
+            let h1 = a0.allele;
+            let h2 = a1.allele;
+            if h1.is_none() && h2.is_none() {
+                bits.hap1_missing[word] |= bit;
+                bits.hap2_missing[word] |= bit;
                 continue;
-            };
-            let Some(h2) = a1.allele else {
-                bits.missing[word] |= bit;
+            }
+            // htslib stores the phase separator on the second allele; the
+            // first allele of a phased diploid GT may have phased=false.
+            if !a1.phased
+                || h1.is_some_and(|h| !(0..=1).contains(&h))
+                || h2.is_some_and(|h| !(0..=1).contains(&h))
+            {
+                bits.fallback[word] |= bit;
                 continue;
-            };
-            if !a0.phased || !a1.phased || !(0..=1).contains(&h1) || !(0..=1).contains(&h2) {
-                return None;
             }
-            if h1 == 1 {
-                bits.hap1_alt[word] |= bit;
+            match h1 {
+                Some(1) => bits.hap1_alt[word] |= bit,
+                Some(_) => {}
+                None => bits.hap1_missing[word] |= bit,
             }
-            if h2 == 1 {
-                bits.hap2_alt[word] |= bit;
+            match h2 {
+                Some(1) => bits.hap2_alt[word] |= bit,
+                Some(_) => {}
+                None => bits.hap2_missing[word] |= bit,
             }
         }
         Some(bits)
@@ -184,7 +206,15 @@ impl BiallelicPhasedGtBits {
         }
         let word = sample_idx / 64;
         let bit = 1u64 << (sample_idx & 63);
-        if self.missing[word] & bit != 0 {
+        if self.fallback[word] & bit != 0 {
+            return None;
+        }
+        let missing_bits = if hap == 1 {
+            &self.hap1_missing
+        } else {
+            &self.hap2_missing
+        };
+        if missing_bits[word] & bit != 0 {
             return Some(None);
         }
         let alt_bits = if hap == 1 {
@@ -214,8 +244,44 @@ impl BiallelicPhasedGtBits {
     }
 
     #[inline]
-    pub fn missing_words(&self) -> &[u64] {
-        &self.missing
+    pub fn alt_words_for_hap_index(&self, hap_idx: usize) -> &[u64] {
+        debug_assert!(hap_idx < 2);
+        if hap_idx == 0 {
+            &self.hap1_alt
+        } else {
+            &self.hap2_alt
+        }
+    }
+
+    #[inline]
+    pub fn missing_words_for_hap_index(&self, hap_idx: usize) -> &[u64] {
+        debug_assert!(hap_idx < 2);
+        if hap_idx == 0 {
+            &self.hap1_missing
+        } else {
+            &self.hap2_missing
+        }
+    }
+
+    #[inline]
+    pub fn fallback_words(&self) -> &[u64] {
+        &self.fallback
+    }
+
+    fn validate_shape(&self, n_samples: usize) -> io::Result<()> {
+        if self.n_samples != n_samples {
+            return Err(invalid_data("GT bitset sample count mismatch"));
+        }
+        let expected_words = n_samples.div_ceil(64);
+        if self.hap1_alt.len() != expected_words
+            || self.hap2_alt.len() != expected_words
+            || self.hap1_missing.len() != expected_words
+            || self.hap2_missing.len() != expected_words
+            || self.fallback.len() != expected_words
+        {
+            return Err(invalid_data("GT bitset word length mismatch"));
+        }
+        Ok(())
     }
 }
 
@@ -1323,7 +1389,13 @@ impl VcfStore {
         cache_path: &Path,
         source_fp: SourceFingerprint,
     ) -> io::Result<Self> {
-        let mut r = BufReader::new(File::open(cache_path)?);
+        let cache_len = fs::metadata(cache_path)?.len();
+        if cache_len < std::mem::size_of::<u64>() as u64 {
+            return Err(invalid_data("cvcf cache too small"));
+        }
+        let payload_len = cache_len - std::mem::size_of::<u64>() as u64;
+        let take = BufReader::new(File::open(cache_path)?).take(payload_len);
+        let mut r = ChecksumReader::new(take);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != CVCF_MAGIC {
@@ -1334,6 +1406,7 @@ impl VcfStore {
             return Err(invalid_data("unsupported cvcf version"));
         }
         let cached_fp = SourceFingerprint {
+            path_hash: read_u64(&mut r)?,
             len: read_u64(&mut r)?,
             mtime_secs: read_i64(&mut r)?,
             mtime_nanos: read_u32(&mut r)?,
@@ -1402,15 +1475,26 @@ impl VcfStore {
             store.records.push(record);
         }
         read_coord_index(&mut r, &mut store)?;
+        let checksum = r.checksum();
+        let take = r.into_inner();
+        if take.limit() != 0 {
+            return Err(invalid_data("unread cvcf payload bytes"));
+        }
+        let mut raw = take.into_inner();
+        let footer_checksum = read_u64(&mut raw)?;
+        if footer_checksum != checksum {
+            return Err(invalid_data("cvcf checksum mismatch"));
+        }
         store.validate_compiled_store()?;
         Ok(store)
     }
 
     fn write_cache_file(&self, cache_path: &Path, source_fp: SourceFingerprint) -> io::Result<()> {
         self.validate_compiled_store()?;
-        let mut w = BufWriter::new(File::create(cache_path)?);
+        let mut w = ChecksumWriter::new(BufWriter::new(File::create(cache_path)?));
         w.write_all(CVCF_MAGIC)?;
         write_u32(&mut w, CVCF_VERSION)?;
+        write_u64(&mut w, source_fp.path_hash)?;
         write_u64(&mut w, source_fp.len)?;
         write_i64(&mut w, source_fp.mtime_secs)?;
         write_u32(&mut w, source_fp.mtime_nanos)?;
@@ -1436,7 +1520,7 @@ impl VcfStore {
             write_gt_bits(&mut w, rec.gt_bits.as_ref())?;
         }
         write_coord_index(&mut w, self)?;
-        w.flush()
+        w.finish()
     }
 
     fn validate_compiled_store(&self) -> io::Result<()> {
@@ -1489,9 +1573,7 @@ impl VcfStore {
                 return Err(invalid_data("raw GT sample count mismatch"));
             }
             if let Some(bits) = rec.gt_bits.as_ref() {
-                if bits.n_samples != self.n_sample.max(0) as usize {
-                    return Err(invalid_data("GT bitset sample count mismatch"));
-                }
+                bits.validate_shape(self.n_sample.max(0) as usize)?;
             }
         }
 
@@ -1574,6 +1656,7 @@ impl VcfStore {
                 ffi::hts_close(fp);
                 return Err(format!("bcf_hdr_read failed for {}", self.path.display()));
             }
+            ensure_known_missing_format_headers(hdr)?;
 
             // Samples
             self.n_sample = ffi::shim_bcf_hdr_nsamples(hdr);
@@ -1619,6 +1702,7 @@ impl VcfStore {
             let mut gt_cap: c_int = 0;
             let gt_tag = CString::new("GT").unwrap();
             let unpack_what = ffi::BCF_UN_STR | ffi::BCF_UN_FMT;
+            let mut malformed_records = 0usize;
 
             loop {
                 let r = ffi::bcf_read(fp, hdr, rec);
@@ -1626,7 +1710,20 @@ impl VcfStore {
                     break; // EOF
                 }
                 if r < -1 {
-                    return Err(format!("bcf_read error code {}", r));
+                    malformed_records += 1;
+                    if malformed_records <= 16 {
+                        eprintln!(
+                            "[W::vcf_parse] Skipping malformed VCF record in {} after bcf_read error code {}",
+                            self.path.display(),
+                            r
+                        );
+                    } else if malformed_records == 17 {
+                        eprintln!(
+                            "[W::vcf_parse] Further malformed VCF record warnings suppressed for {}",
+                            self.path.display()
+                        );
+                    }
+                    continue;
                 }
                 if ffi::bcf_unpack(rec, unpack_what) < 0 {
                     return Err("bcf_unpack failed".to_string());
@@ -1728,6 +1825,13 @@ impl VcfStore {
                 self.hot.push_record(&record);
                 self.records.push(record);
             }
+            if malformed_records != 0 {
+                eprintln!(
+                    "[W::vcf_parse] Skipped {} malformed VCF record(s) while loading {}",
+                    malformed_records,
+                    self.path.display()
+                );
+            }
 
             if !gt_buf.is_null() {
                 ffi::free(gt_buf);
@@ -1755,11 +1859,87 @@ fn source_fingerprint(path: &Path) -> io::Result<SourceFingerprint> {
     let duration = modified
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid_data("source mtime before unix epoch"))?;
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     Ok(SourceFingerprint {
+        path_hash: fnv1a64(canonical.to_string_lossy().as_bytes()),
         len: meta.len(),
         mtime_secs: duration.as_secs() as i64,
         mtime_nanos: duration.subsec_nanos(),
     })
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(FNV1A64_OFFSET, bytes)
+}
+
+fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    hash
+}
+
+struct ChecksumWriter<W> {
+    inner: W,
+    hash: u64,
+}
+
+impl<W: Write> ChecksumWriter<W> {
+    fn new(inner: W) -> Self {
+        ChecksumWriter {
+            inner,
+            hash: FNV1A64_OFFSET,
+        }
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        let checksum = self.hash;
+        self.inner.write_all(&checksum.to_le_bytes())?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for ChecksumWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hash = fnv1a64_update(self.hash, &buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ChecksumReader<R> {
+    inner: R,
+    hash: u64,
+}
+
+impl<R: Read> ChecksumReader<R> {
+    fn new(inner: R) -> Self {
+        ChecksumReader {
+            inner,
+            hash: FNV1A64_OFFSET,
+        }
+    }
+
+    fn checksum(&self) -> u64 {
+        self.hash
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hash = fnv1a64_update(self.hash, &buf[..n]);
+        Ok(n)
+    }
 }
 
 struct DecodedGtStores {
@@ -1800,7 +1980,9 @@ fn decode_gt_stores(
         n_samples,
         hap1_alt: vec![0; n_samples.div_ceil(64)],
         hap2_alt: vec![0; n_samples.div_ceil(64)],
-        missing: vec![0; n_samples.div_ceil(64)],
+        hap1_missing: vec![0; n_samples.div_ceil(64)],
+        hap2_missing: vec![0; n_samples.div_ceil(64)],
+        fallback: vec![0; n_samples.div_ceil(64)],
     });
 
     for sample_idx in 0..n_samples {
@@ -1841,38 +2023,59 @@ fn decode_gt_stores(
             }
         }
 
-        if is_biallelic_phased_diploid && sample_len != 2 {
-            is_biallelic_phased_diploid = false;
-        }
         if let Some(bits) = gt_bits.as_mut() {
             if sample_len != 2 {
-                gt_bits = None;
+                let is_single_missing = sample_len == 1 && ffi::gt_is_missing(hap_raw[0]);
+                if is_single_missing {
+                    let word = sample_idx / 64;
+                    let bit = 1u64 << (sample_idx & 63);
+                    bits.hap1_missing[word] |= bit;
+                    bits.hap2_missing[word] |= bit;
+                    is_biallelic_phased_diploid = false;
+                } else {
+                    let word = sample_idx / 64;
+                    let bit = 1u64 << (sample_idx & 63);
+                    bits.fallback[word] |= bit;
+                    is_biallelic_phased_diploid = false;
+                }
                 continue;
             }
             let word = sample_idx / 64;
             let bit = 1u64 << (sample_idx & 63);
             let a0_missing = ffi::gt_is_missing(hap_raw[0]);
             let a1_missing = ffi::gt_is_missing(hap_raw[1]);
-            if a0_missing || a1_missing {
-                bits.missing[word] |= bit;
+            if a0_missing && a1_missing {
+                bits.hap1_missing[word] |= bit;
+                bits.hap2_missing[word] |= bit;
+                is_biallelic_phased_diploid = false;
+                continue;
+            }
+            let phased = ffi::gt_is_phased(hap_raw[1]);
+            if (a0_missing || a1_missing) && !phased {
+                bits.fallback[word] |= bit;
                 is_biallelic_phased_diploid = false;
                 continue;
             }
             let h0 = ffi::gt_allele(hap_raw[0]);
             let h1 = ffi::gt_allele(hap_raw[1]);
-            if !ffi::gt_is_phased(hap_raw[0])
-                || !ffi::gt_is_phased(hap_raw[1])
-                || !(0..=1).contains(&h0)
-                || !(0..=1).contains(&h1)
+            if (!a0_missing && !(0..=1).contains(&h0))
+                || (!a1_missing && !(0..=1).contains(&h1))
+                || !phased
             {
-                gt_bits = None;
+                bits.fallback[word] |= bit;
                 is_biallelic_phased_diploid = false;
                 continue;
             }
-            if h0 == 1 {
+            if a0_missing {
+                bits.hap1_missing[word] |= bit;
+                is_biallelic_phased_diploid = false;
+            } else if h0 == 1 {
                 bits.hap1_alt[word] |= bit;
             }
-            if h1 == 1 {
+            if a1_missing {
+                bits.hap2_missing[word] |= bit;
+                is_biallelic_phased_diploid = false;
+            } else if h1 == 1 {
                 bits.hap2_alt[word] |= bit;
             }
         }
@@ -2180,11 +2383,15 @@ fn read_gt_bits<R: Read>(r: &mut R) -> io::Result<Option<BiallelicPhasedGtBits>>
     let n_samples = read_len(r)?;
     let hap1_alt = read_u64_vec(r)?;
     let hap2_alt = read_u64_vec(r)?;
-    let missing = read_u64_vec(r)?;
+    let hap1_missing = read_u64_vec(r)?;
+    let hap2_missing = read_u64_vec(r)?;
+    let fallback = read_u64_vec(r)?;
     let expected_words = n_samples.div_ceil(64);
     if hap1_alt.len() != expected_words
         || hap2_alt.len() != expected_words
-        || missing.len() != expected_words
+        || hap1_missing.len() != expected_words
+        || hap2_missing.len() != expected_words
+        || fallback.len() != expected_words
     {
         return Err(invalid_data("invalid gt bitset length"));
     }
@@ -2192,7 +2399,9 @@ fn read_gt_bits<R: Read>(r: &mut R) -> io::Result<Option<BiallelicPhasedGtBits>>
         n_samples,
         hap1_alt,
         hap2_alt,
-        missing,
+        hap1_missing,
+        hap2_missing,
+        fallback,
     }))
 }
 
@@ -2204,7 +2413,9 @@ fn write_gt_bits<W: Write>(w: &mut W, bits: Option<&BiallelicPhasedGtBits>) -> i
     write_len(w, bits.n_samples)?;
     write_u64_slice(w, &bits.hap1_alt)?;
     write_u64_slice(w, &bits.hap2_alt)?;
-    write_u64_slice(w, &bits.missing)
+    write_u64_slice(w, &bits.hap1_missing)?;
+    write_u64_slice(w, &bits.hap2_missing)?;
+    write_u64_slice(w, &bits.fallback)
 }
 
 fn read_coord_index<R: Read>(r: &mut R, store: &mut VcfStore) -> io::Result<()> {
@@ -2707,6 +2918,40 @@ unsafe fn cstr_to_bytes(p: *const std::os::raw::c_char) -> SmallVec<[u8; 16]> {
     SmallVec::from_slice(s.to_bytes())
 }
 
+unsafe fn ensure_known_missing_format_headers(hdr: *mut ffi::bcf_hdr_t) -> Result<(), String> {
+    const FORMAT_PATCHES: [(&str, &str); 2] = [
+        (
+            "PP",
+            "##FORMAT=<ID=PP,Number=.,Type=String,Description=\"Injected compatibility definition for VCFs missing this FORMAT header; matches htslib's unknown-FORMAT string fallback\">",
+        ),
+        (
+            "BD",
+            "##FORMAT=<ID=BD,Number=1,Type=String,Description=\"Injected compatibility definition for VCFs missing this FORMAT header; matches htslib's unknown-FORMAT string fallback\">",
+        ),
+    ];
+
+    let mut changed = false;
+    for (id, line) in FORMAT_PATCHES {
+        let cid = CString::new(id).expect("static FORMAT ID has no NUL");
+        if ffi::bcf_hdr_id2int(hdr, ffi::BCF_DT_ID, cid.as_ptr()) >= 0 {
+            continue;
+        }
+        let cline = CString::new(line).expect("static FORMAT line has no NUL");
+        if ffi::bcf_hdr_append(hdr, cline.as_ptr()) < 0 {
+            return Err(format!("failed to inject missing FORMAT header for {}", id));
+        }
+        eprintln!(
+            "[W::vcf_parse_format_header] FORMAT '{}' is not defined in the header; injecting compatibility definition",
+            id
+        );
+        changed = true;
+    }
+    if changed && ffi::bcf_hdr_sync(hdr) < 0 {
+        return Err("failed to sync VCF header after injecting FORMAT definitions".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2807,10 +3052,52 @@ mod tests {
         );
         let store = VcfStore::load(&vcf).expect("missing ##contig should warn, not fail");
         // contig auto-registered, queryable both with and without chr prefix
-        let rid = store.rid_of("chr1").expect("chr1 should be auto-registered");
+        let rid = store
+            .rid_of("chr1")
+            .expect("chr1 should be auto-registered");
         assert_eq!(store.rid_of("1"), Some(rid));
         assert_eq!(store.query("chr1", 9, 9, 0).len(), 1);
         assert_eq!(store.query("1", 9, 9, 0).len(), 1);
+    }
+
+    #[test]
+    fn missing_pp_bd_format_headers_warn_and_parse() {
+        let vcf = write_vcf_with_header(
+            "missing_pp_bd_format_headers",
+            "##fileformat=VCFv4.3\n\
+             ##contig=<ID=chr1,length=1000>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Genotype dosage\">\n\
+             ##FORMAT=<ID=GL,Number=.,Type=Float,Description=\"Genotype likelihoods\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT:GL:DS:PP:BD\t0|1:.:.:0,1,0:.\t1|1:.:.:0,0,1:2\n",
+        );
+        let store =
+            VcfStore::load(&vcf).expect("missing PP/BD FORMAT headers should warn, not fail");
+        assert_eq!(store.n_records(), 1);
+        assert_eq!(store.n_sample(), 2);
+        assert_eq!(store.query("chr1", 9, 9, 0).len(), 1);
+    }
+
+    #[test]
+    fn malformed_format_records_warn_and_are_skipped() {
+        let vcf = write_vcf_with_header(
+            "malformed_format_records",
+            "##fileformat=VCFv4.3\n\
+             ##contig=<ID=chr1,length=1000>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             ##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Genotype dosage\">\n\
+             ##FORMAT=<ID=GL,Number=.,Type=Float,Description=\"Genotype likelihoods\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT:GL:DS:PP:BD\t0|1:.:.:0,1,0:1\t1|1:.:.:0,0,1:2\n\
+             chr1\t20\t.\tG\tA\t.\t.\t.\tGT:GL:DS:PP:BD\t0|1:.:.:0,1,0:1:extra\t1|1:.:.:0,0,1:2\n\
+             chr1\t30\t.\tG\tA\t.\t.\t.\tGT:GL:DS:PP:BD\t0|0:.:.:1,0,0:0\t0|1:.:.:0,1,0:1\n",
+        );
+        let store = VcfStore::load(&vcf).expect("malformed FORMAT records should warn, not fail");
+        assert_eq!(store.n_records(), 2);
+        assert_eq!(store.query("chr1", 9, 9, 0).len(), 1);
+        assert_eq!(store.query("chr1", 19, 19, 0).len(), 0);
+        assert_eq!(store.query("chr1", 29, 29, 0).len(), 1);
     }
 
     #[test]
@@ -2926,6 +3213,28 @@ mod tests {
     }
 
     #[test]
+    fn cvcf_cache_rejects_footer_checksum_mismatch() {
+        let vcf = write_vcf(
+            "cache_checksum_mismatch",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|1\n",
+        );
+        let cache_path = VcfStore::default_cache_path(&vcf);
+        let _parsed = VcfStore::load(&vcf).unwrap();
+        let mut bytes = std::fs::read(&cache_path).unwrap();
+        let last = bytes.last_mut().expect("cache has checksum footer");
+        *last ^= 0x55;
+        std::fs::write(&cache_path, bytes).unwrap();
+
+        let fp = source_fingerprint(&vcf).unwrap();
+        let err = match VcfStore::read_cache_file(vcf, &cache_path, fp) {
+            Ok(_) => panic!("corrupt cache footer should not load"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "cvcf checksum mismatch");
+    }
+
+    #[test]
     fn builds_biallelic_phased_gt_bitset() {
         let vcf = write_vcf("gt_bitset", "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|0\n");
         let store = VcfStore::load(&vcf).unwrap();
@@ -2936,6 +3245,62 @@ mod tests {
         assert_eq!(bits.allele_for_hap(0, 2), Some(Some(1)));
         assert_eq!(bits.allele_for_hap(1, 1), Some(Some(1)));
         assert_eq!(bits.allele_for_hap(1, 2), Some(Some(0)));
+        assert_eq!(store.compile_stats().biallelic_gt_bitset_records, 1);
+    }
+
+    #[test]
+    fn biallelic_gt_bitset_allows_single_missing_samples() {
+        let vcf = write_vcf(
+            "gt_bitset_single_missing",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t.\t0|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let rec = &store.records()[0];
+        let bits = rec.gt_bits.as_ref().expect("missing sample still bitsets");
+
+        assert_eq!(bits.allele_for_hap(0, 1), Some(None));
+        assert_eq!(bits.allele_for_hap(0, 2), Some(None));
+        assert_eq!(bits.allele_for_hap(1, 1), Some(Some(0)));
+        assert_eq!(bits.allele_for_hap(1, 2), Some(Some(1)));
+        assert_eq!(store.compile_stats().biallelic_gt_bitset_records, 1);
+        assert_eq!(store.compile_stats().missing_gt_records, 1);
+    }
+
+    #[test]
+    fn biallelic_gt_bitset_tracks_partial_missing_per_haplotype() {
+        let vcf = write_vcf(
+            "gt_bitset_partial_missing",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t.|1\t0|.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let rec = &store.records()[0];
+        let bits = rec
+            .gt_bits
+            .as_ref()
+            .expect("partial missing phased samples still bitset");
+
+        assert_eq!(bits.allele_for_hap(0, 1), Some(None));
+        assert_eq!(bits.allele_for_hap(0, 2), Some(Some(1)));
+        assert_eq!(bits.allele_for_hap(1, 1), Some(Some(0)));
+        assert_eq!(bits.allele_for_hap(1, 2), Some(None));
+        assert_eq!(store.compile_stats().biallelic_gt_bitset_records, 1);
+        assert_eq!(store.compile_stats().missing_gt_records, 1);
+    }
+
+    #[test]
+    fn biallelic_gt_bitset_keeps_unphased_samples_as_fallback_mask() {
+        let vcf = write_vcf(
+            "gt_bitset_unphased_fallback",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0/1\t0|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let rec = &store.records()[0];
+        let bits = rec.gt_bits.as_ref().expect("mixed phased record bitsets");
+
+        assert_eq!(bits.allele_for_hap(0, 1), None);
+        assert_eq!(bits.allele_for_hap(0, 2), None);
+        assert_eq!(bits.allele_for_hap(1, 1), Some(Some(0)));
+        assert_eq!(bits.allele_for_hap(1, 2), Some(Some(1)));
         assert_eq!(store.compile_stats().biallelic_gt_bitset_records, 1);
     }
 

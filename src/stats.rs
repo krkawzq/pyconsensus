@@ -87,6 +87,7 @@ pub struct RuntimeStats {
     pub same_len_fastpath_records: u64,
     pub edit_script_fastpath_records: u64,
     pub fallback_records: u64,
+    pub alloc_bytes: u64,
 }
 
 impl RuntimeStats {
@@ -98,6 +99,10 @@ impl RuntimeStats {
         self.tasks_total += 1;
     }
 
+    pub fn observe_tasks(&mut self, n: u64) {
+        self.tasks_total += n;
+    }
+
     pub fn observe_lane(&mut self, lane: FastPathLane) {
         self.lane_counts[lane.as_usize()] += 1;
     }
@@ -106,16 +111,32 @@ impl RuntimeStats {
         self.records_seen += 1;
     }
 
+    pub fn observe_records(&mut self, n: u64) {
+        self.records_seen += n;
+    }
+
     pub fn observe_same_len_fastpath(&mut self) {
         self.same_len_fastpath_records += 1;
+    }
+
+    pub fn observe_same_len_fastpath_records(&mut self, n: u64) {
+        self.same_len_fastpath_records += n;
     }
 
     pub fn observe_edit_script_fastpath(&mut self) {
         self.edit_script_fastpath_records += 1;
     }
 
+    pub fn observe_edit_script_fastpath_records(&mut self, n: u64) {
+        self.edit_script_fastpath_records += n;
+    }
+
     pub fn observe_fallback_records(&mut self, n: u64) {
         self.fallback_records += n;
+    }
+
+    pub fn observe_alloc_bytes(&mut self, n: u64) {
+        self.alloc_bytes += n;
     }
 
     pub fn observe_fallback_reason(&mut self, reason: FallbackReason) {
@@ -136,6 +157,22 @@ impl RuntimeStats {
         self.fallback_reasons[reason.as_usize()]
     }
 
+    pub fn merge(&mut self, other: RuntimeStats) {
+        self.regions_total += other.regions_total;
+        self.tasks_total += other.tasks_total;
+        self.records_seen += other.records_seen;
+        for (dst, src) in self.lane_counts.iter_mut().zip(other.lane_counts) {
+            *dst += src;
+        }
+        for (dst, src) in self.fallback_reasons.iter_mut().zip(other.fallback_reasons) {
+            *dst += src;
+        }
+        self.same_len_fastpath_records += other.same_len_fastpath_records;
+        self.edit_script_fastpath_records += other.edit_script_fastpath_records;
+        self.fallback_records += other.fallback_records;
+        self.alloc_bytes += other.alloc_bytes;
+    }
+
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("regions_total={}", self.regions_total),
@@ -150,6 +187,7 @@ impl RuntimeStats {
                 self.edit_script_fastpath_records
             ),
             format!("fallback_records={}", self.fallback_records),
+            format!("alloc_bytes={}", self.alloc_bytes),
         ];
         for lane in [
             FastPathLane::EmptyRegion,

@@ -153,7 +153,10 @@ impl AlleleOp {
     pub fn is_edit_script_fastpath(&self) -> bool {
         matches!(
             self.kind,
-            AlleleOpKind::SameLen | AlleleOpKind::Insert | AlleleOpKind::Delete
+            AlleleOpKind::SameLen
+                | AlleleOpKind::Insert
+                | AlleleOpKind::Delete
+                | AlleleOpKind::SymbolicDel
         )
     }
 
@@ -319,6 +322,23 @@ impl VcfCompileStats {
                 "record_kind.{}={}",
                 kind.name(),
                 self.kind_count(kind)
+            ));
+        }
+        for kind in [
+            AlleleOpKind::Ref,
+            AlleleOpKind::SameLen,
+            AlleleOpKind::Insert,
+            AlleleOpKind::Delete,
+            AlleleOpKind::Replace,
+            AlleleOpKind::SymbolicDel,
+            AlleleOpKind::GvcfRefBlock,
+            AlleleOpKind::Missing,
+            AlleleOpKind::Unsupported,
+        ] {
+            lines.push(format!(
+                "allele_op.{}={}",
+                kind.name(),
+                self.allele_op_count(kind)
             ));
         }
         lines.push(format!("biallelic_records={}", self.biallelic_records));

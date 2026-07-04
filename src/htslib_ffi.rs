@@ -62,6 +62,7 @@ pub const BCF_UN_FMT: c_int = 8;
 pub const BCF_UN_ALL: c_int = BCF_UN_STR | 2 | 4 | BCF_UN_FMT;
 
 /// bcf_hdr_id2int `type`
+pub const BCF_DT_ID: c_int = 0;
 pub const BCF_DT_CTG: c_int = 1;
 
 /// bcf_get_format_values `type`
@@ -148,6 +149,8 @@ extern "C" {
 
     pub fn bcf_hdr_read(fp: *mut htsFile) -> *mut bcf_hdr_t;
     pub fn bcf_hdr_destroy(h: *mut bcf_hdr_t);
+    pub fn bcf_hdr_append(h: *mut bcf_hdr_t, line: *const c_char) -> c_int;
+    pub fn bcf_hdr_sync(h: *mut bcf_hdr_t) -> c_int;
     /// `type` = BCF_DT_CTG for contigs. Returns -1 if not found.
     pub fn bcf_hdr_id2int(h: *const bcf_hdr_t, typ: c_int, id: *const c_char) -> c_int;
     /// Fills *nseqs; returns array of seq names (owned by header, do not free).
