@@ -96,6 +96,8 @@ jobs:
 
       - name: Import smoke
         run: |
+          cd ~  # leave the source tree so we import the installed wheel, not
+                # the checkout's pyconsensus/ (which has no _engine.abi3.so).
           # Import the native extension directly first so a load failure
           # surfaces with its real error (missing NEEDED lib, etc.) instead
           # of a misleading "No module named pyconsensus._engine".
