@@ -20,9 +20,28 @@ A Rust rewrite of `bcftools consensus` for the enformer expression-prediction pi
 
 ## 💡 Why?
 
-The original pipeline (`make_consensus_enformer_new.py`) spawns **one `bcftools consensus` subprocess per *gene × sample × haplotype*** — on the order of **10M invocations**. Each pays for: process start → reopen & reparse the same VCF → re-read the ref slice → write fasta → build `.fai`.
+The reference pipeline builds a personal diploid consensus sequence for every
+*gene × sample × haplotype* combination — on the order of **10M sequences**.
+Each sequence is produced by shelling out to `bcftools consensus` as a fresh
+subprocess, and the pipeline requires that **all sequences be materialized
+upfront, offline, and stored expanded** before downstream code ever runs.
 
-The bottleneck is the **repeated spawning, reparsing, and disk I/O** — not the consensus algorithm itself.
+That shape is expensive in three ways that compound across millions of calls:
+
+- **Per-call process startup** — every sequence pays for spawning a process,
+  re-opening and re-parsing the *same* VCF, re-reading the *same* reference
+  slice, writing a fasta, and building a `.fai`. The consensus algorithm itself
+  is cheap; the wrapping I/O and fork overhead is not.
+- **Offline pre-materialization** — sequences cannot be produced on demand;
+  they must all be generated ahead of time and kept on disk, so the working
+  set is the full expanded corpus rather than whatever the consumer currently
+  needs.
+- **Expanded storage footprint** — every sequence lands on disk as fasta +
+  index, so peak storage scales with the total sequence count and length
+  rather than with the streaming throughput the consumer can absorb.
+
+The bottleneck is this **spawn-per-sequence + offline + expand-everything**
+shape — not the consensus algorithm.
 
 ## ⚙️ How
 
