@@ -41,14 +41,13 @@ jobs:
           # provisions; broader compatibility than 2_34 and matches what PyO3
           # publishes. build.rs compiles htslib + the 5 compression libs from
           # source with -fPIC for the final static link, but htslib's own
-          # ./configure still probes the system for headers to decide which
-          # codecs to enable — so the container needs the -devel packages too.
-          # zstd-devel / libdeflate-devel live in EPEL on EL8.
+          # ./configure still probes the system for the mandatory bz2/zlib/lzma
+          # headers (zstd/libdeflate are optional and auto-disable if absent —
+          # build.rs still links its own PIC builds of them, harmlessly).
           manylinux: "2_28"
           before-script-linux: |
-            yum install -y epel-release
             yum install -y autoconf automake libtool make gcc cmake \
-              zlib-devel bzip2-devel xz-devel zstd-devel libdeflate-devel
+              zlib-devel bzip2-devel xz-devel
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

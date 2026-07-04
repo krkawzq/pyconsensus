@@ -136,9 +136,10 @@ jobs:
           # apt on ubuntu-22.04 ships bcftools 1.13 (too old); install 1.23 via
           # micromamba (faster + more reliable solver than conda). Channel
           # order conda-forge > bioconda is the bioconda-recommended setup.
-          wget -qO /tmp/micromamba https://micromamba.snakepit.net/api/micromamba/linux-64/latest
-          chmod +x /tmp/micromamba
-          /tmp/micromamba create -y --prefix "$HOME/mbenv" \
+          # The download endpoint returns a tar.bz2, not a bare binary.
+          curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/latest \
+            | tar -xj -C /tmp bin/micromamba
+          /tmp/bin/micromamba create -y --prefix "$HOME/mbenv" \
             -c conda-forge -c bioconda bcftools=1.23 htslib=1.23 tabix
           echo "$HOME/mbenv/bin" >> "$GITHUB_PATH"
 
