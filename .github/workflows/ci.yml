@@ -117,13 +117,21 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install bcftools + build deps
+      - name: Install build deps + bcftools 1.23 via conda
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool make gcc cmake \
-            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev \
-            bcftools tabix
+            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
+          # The parity tests shell out to `bcftools consensus` and assert
+          # byte-identical output, so the bcftools version must match the
+          # htslib/bcftools 1.23.1 the Rust port was pinned from. apt on
+          # ubuntu-22.04 ships bcftools 1.13 (too old); install 1.23 via conda.
+          wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/mc.sh
+          bash /tmp/mc.sh -b -p "$HOME/miniconda" >/dev/null
+          echo "$HOME/miniconda/bin" >> "$GITHUB_PATH"
+          conda install -y -c bioconda bcftools=1.23 tabix || \
+            conda install -y -c conda-forge -c bioconda bcftools=1.23
 
       - name: Verify tools on PATH
         run: |
