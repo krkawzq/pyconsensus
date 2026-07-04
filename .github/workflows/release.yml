@@ -37,12 +37,13 @@ jobs:
         with:
           command: build
           args: --release -o dist
-          # Build inside a manylinux_2_34 container so the resulting wheel is
-          # manylinux-compliant (matches local scripts/build_wheels.sh). The
-          # container is AlmaLinux 9 based, so use dnf/yum.
-          container: manylinux_2_34
+          # manylinux_2_28 (glibc 2.28) is the newest x86_64 image maturin-action
+          # provisions; broader compatibility than 2_34 and matches what PyO3
+          # publishes. build.rs compiles htslib + the 5 compression libs from
+          # source with -fPIC, so we only need autotools/cmake in the container.
+          manylinux: "2_28"
           before-script-linux: |
-            dnf install -y autoconf automake libtool make gcc cmake \
+            yum install -y autoconf automake libtool make gcc cmake \
               zlib-devel bzip2-devel xz-devel zstd-devel
 
       - name: Upload wheel artifact
