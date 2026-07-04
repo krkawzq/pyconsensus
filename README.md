@@ -77,7 +77,7 @@ tasks = [
 # (1) Eager: run a flat task list, get results back in input order.
 results = engine.consensus_many(tasks, threads=8)
 for r in results:
-    print(r.gene_id, r.sample, r.haplotype, len(r.seq))   # r.seq: bytes
+    print(r.gene_id, r.sample, r.haplotype, len(r.seq or b""))   # r.seq: bytes | None
 
 # (2) Lazy: producer-consumer iterator; GIL released while workers run.
 it = engine.consensus_iter(tasks, threads=8, prefetch_steps=16)
@@ -116,6 +116,80 @@ the next sample, then the next gene) — matching the original script's layout.
 When `max_tasks_per_group > 0`, the number of in-flight tasks is bounded by
 `max(prefetch_steps, 1) × max_tasks_per_group`; `0` preserves the original
 unlimited group behavior.
+
+## API reference
+
+### `ConsensusEngine(ref_path, vcfs, **opts)`
+
+Constructor options (besides `ref_path` and `vcfs: {vcf_key: path}`):
+
+| Option | Type | Default | bcftools | Notes |
+|---|---|---|---|---|
+| `iupac_codes` | bool | `False` | `-I` | IUPAC-encode ambiguous alleles |
+| `missing` | str\|None | `None` | `-M` | char for missing alleles (single char) |
+| `absent` | str\|None | `None` | `-a` | char for absent alleles (single char) |
+| `mark_del` | str\|None | `None` | `--mark-del` | char marking deletions (single char) |
+| `mark_ins` | str\|None | `None` | `--mark-ins` | `"uc"` / `"lc"` / single char |
+| `mark_snv` | str\|None | `None` | `--mark-snv` | `"uc"` / `"lc"` / single char |
+| `mask` | str\|None | `None` | `-m` | path to a mask BED |
+| `mask_with` | str | `"N"` | `--mask-with` | `"uc"` / `"lc"` / single char |
+| `chain` | bool | `False` | `-c` | emit a VCF chain alongside each seq |
+| `regions_overlap` | int | `0` | — | record filter: `0`=POS-in-region, `1`=record-span overlap, `2`=variant-span overlap |
+| `max_tasks_per_group` | int | `0` | — | `0`=unlimited; positive splits large region groups |
+| `compile_threads` | int\|None | `None` | — | rayon pool for VCF compile (defaults to available parallelism capped at the unique-VCF count) |
+| `log_level` | str | `"info"` | — | `off` / `error` / `warn` / `info` / `debug` |
+
+### Engine methods
+
+| Method | Returns | Notes |
+|---|---|---|
+| `consensus_many(tasks, threads=1)` | `list[ConsensusResult]` | input order |
+| `consensus_iter(tasks, prefetch_steps=None, warmup=False, ordered=False, threads=1)` | `_ConsensusIter` | lazy; yields `(idx, ConsensusResult)` |
+| `consensus_regions(regions, samples=None, haplotypes=None, *, threads=1, prefetch_steps=None, warmup=False, ordered=False)` | `_ConsensusIter` | cartesian product → lazy iterator |
+| `consensus_many_stats(tasks, threads=1)` | `(n, total_len, min_len, max_len)` | consumes bytes in Rust; builds no Python list |
+| `consensus_iter_stats(tasks, prefetch_steps=None, warmup=False, ordered=False, threads=1)` | `(n, total_len, min_len, max_len)` | iter version of the above |
+| `consensus_many_profile(tasks, threads=1)` | `list[str]` | throughput + lane/fallback kv lines |
+| `compile_stats()` | `list[str]` | VCF record/allele/GT layout kv lines |
+| `log_level` (read/write property) | `str` | runtime engine log level |
+
+### Iterator (`_ConsensusIter`)
+
+| Member | Returns |
+|---|---|
+| `__iter__` / `__next__` | yields `(idx, ConsensusResult)`; GIL released while blocking |
+| `next_batch(batch_size)` | `list[(idx, ConsensusResult)] \| None` |
+| `next_batch_bytes(batch_size)` | `list[(idx, bytes)] \| None` — lowest-overhead streaming |
+
+### Module-level functions
+
+```python
+from pyconsensus import build_tasks, build_cache, get_htslib_log_level, set_htslib_log_level
+
+# Expand regions × samples × haplotypes into a flat task list (eager).
+# A None (or empty) dimension collapses to one task with that field = None.
+tasks = build_tasks(regions, samples=["NA12878", "NA12879"], haplotypes=["1pIu", "2pIu"])
+
+# Pre-build .cvcf caches without loading the reference or building the engine.
+results = build_cache(
+    ["data/variants/chr1.vcf.gz", "data/variants/chr2.vcf.gz"],
+    compile_threads=4, force=False,
+)
+for r in results:
+    print(r.path, r.cache_path, r.status, r.records, r.samples, f"{r.cache_mb:.1f}MB")
+    # r.status ∈ {"hit", "built", "rebuilt", "forced"}
+
+# htslib log level (off/error/warn/info/debug/trace) — independent of engine log_level.
+set_htslib_log_level("error")
+print(get_htslib_log_level())
+```
+
+### Data classes
+
+| Class | Fields |
+|---|---|
+| `Task` | `chr`, `start`, `end`, `vcf_key`, `gene_id`, `sample`, `haplotype` (all get/set) |
+| `ConsensusResult` | `gene_id`, `sample`, `haplotype`, `seq` (`bytes\|None`), `chain` (`str\|None`), `error` (`str\|None`) — read-only |
+| `CacheResult` | `path`, `cache_path`, `status`, `records`, `samples`, `cache_mb`, `elapsed_sec` — read-only |
 
 ## License
 

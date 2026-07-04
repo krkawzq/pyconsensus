@@ -47,15 +47,26 @@ def get_vcf_path(vcf_dir: str, chrom: str, pattern: str) -> str:
 
 
 def load_genes(path: str) -> list[tuple[str, str, int]]:
-    """Return [(gene_id, chr, tss)] from a csv with rows gene_id,chr,tss,symbol,strand."""
+    """Return [(gene_id, chr, tss)] from a csv with rows gene_id,chr,tss,symbol,strand.
+
+    Uses csv parsing so quoted fields (e.g. a symbol containing a comma) and
+    ragged rows are handled with a clear, line-numbered error.
+    """
+    import csv
+
     genes = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    with open(path, newline="") as f:
+        for lineno, row in enumerate(csv.reader(f), 1):
+            if not row or not row[0].strip() or row[0].strip() == "gene_id":
                 continue
-            gene_id, chrom, tss, _symbol, _strand = line.split(",")
-            genes.append((gene_id, chrom, int(tss)))
+            if len(row) < 3:
+                sys.exit(f"{path}:{lineno}: expected >=3 columns, got {len(row)}: {row!r}")
+            gene_id, chrom, tss = row[0].strip(), row[1].strip(), row[2].strip()
+            try:
+                tss_int = int(tss)
+            except ValueError:
+                sys.exit(f"{path}:{lineno}: tss is not an integer: {tss!r}")
+            genes.append((gene_id, chrom, tss_int))
     return genes
 
 
@@ -143,9 +154,15 @@ def main(argv=None):
     )
 
     n_done = 0
+    n_failed = 0
     if args.no_write:
-        for _idx, _r in it:
-            n_done += 1
+        for _idx, r in it:
+            if r.error is not None or r.seq is None:
+                n_failed += 1
+                if n_failed <= 5:
+                    print(f"skip {r.gene_id}: {r.error or 'no sequence'}", file=sys.stderr)
+            else:
+                n_done += 1
     else:
         for _idx, r in it:
             sample = r.sample or "_ref"
@@ -154,6 +171,16 @@ def main(argv=None):
             hap = r.haplotype or "all"
             out = sdir / f"{r.gene_id}.{hap}.fa"
             seq = r.seq
+            if seq is None:
+                # Failed task: write an empty fasta with the error in the header
+                # so downstream tooling sees a record rather than crashing.
+                n_failed += 1
+                err = (r.error or "no sequence").replace("\n", " ")
+                with open(out, "wb") as f:
+                    f.write(f">{r.gene_id} ERROR={err}\n".encode())
+                if n_failed <= 5:
+                    print(f"skip {r.gene_id}: {err}", file=sys.stderr)
+                continue
             with open(out, "wb") as f:
                 f.write(f">{r.gene_id}\n".encode())
                 # 60-bp wrap, like bcftools/samtools
@@ -162,7 +189,10 @@ def main(argv=None):
                     f.write(b"\n")
             n_done += 1
 
-    print(f"Done: {n_done} sequences", file=sys.stderr)
+    msg = f"Done: {n_done} sequences"
+    if n_failed:
+        msg += f" ({n_failed} failed)"
+    print(msg, file=sys.stderr)
 
 
 if __name__ == "__main__":

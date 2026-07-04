@@ -61,15 +61,26 @@ VCF_PATTERN = "GEUVADIS.chr{n}.PH1PH2_465.IMPFRQFILT_BIALLELIC_PH.annotv2.genoty
 # task / region construction
 # --------------------------------------------------------------------------- #
 def load_genes(path: str) -> list[tuple[str, str, int, str, str]]:
-    """Rows: gene_id,chr,tss,symbol,strand -> [(gene_id, chr, tss, symbol, strand)]."""
+    """Rows: gene_id,chr,tss,symbol,strand -> [(gene_id, chr, tss, symbol, strand)].
+
+    Uses csv parsing so quoted fields (e.g. a symbol containing a comma) and
+    ragged rows are handled with a clear, line-numbered error.
+    """
+    import csv
+
     genes = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("gene_id"):
+    with open(path, newline="") as f:
+        for lineno, row in enumerate(csv.reader(f), 1):
+            if not row or not row[0].strip() or row[0].strip() == "gene_id":
                 continue
-            gid, chrom, tss, symbol, strand = line.split(",")
-            genes.append((gid, chrom, int(tss), symbol, strand))
+            if len(row) < 5:
+                sys.exit(f"{path}:{lineno}: expected 5 columns, got {len(row)}: {row!r}")
+            gid, chrom, tss, symbol, strand = (c.strip() for c in row[:5])
+            try:
+                tss_int = int(tss)
+            except ValueError:
+                sys.exit(f"{path}:{lineno}: tss is not an integer: {tss!r}")
+            genes.append((gid, chrom, tss_int, symbol, strand))
     return genes
 
 
@@ -103,6 +114,15 @@ def build_regions(genes: Sequence[tuple[str, str, int, str, str]]) -> list[Task]
 # --------------------------------------------------------------------------- #
 # bytes -> tensor encoding
 # --------------------------------------------------------------------------- #
+# 256-entry lookup table: byte value -> one-hot channel (0..3 for A/C/G/T),
+# or 255 for unknown. Both cases of each base map to the same channel. Built
+# once at import as a plain bytearray (no torch dependency); converted to a
+# tensor lazily inside encode_onehot so this module imports without torch.
+_ENCODER_LUT = bytearray([255]) * 256
+for _i, _b in enumerate(b"ACGTacgt"):
+    _ENCODER_LUT[_b] = _i % 4
+
+
 def encode_onehot(seq: bytes, include_unknown: bool = True):
     """ACGT (case-insensitive) -> one-hot; anything else -> unknown channel.
 
@@ -110,29 +130,57 @@ def encode_onehot(seq: bytes, include_unknown: bool = True):
       * include_unknown=True  -> C=5 (A,C,G,T,N), unknown bases get the N row.
       * include_unknown=False -> C=4, unknown bases are all-zero.
 
+    One LUT lookup + one scatter per sequence (no per-base Python loop).
     Lazy import torch so the file is importable without torch installed.
     """
     import torch
 
-    table = b"ACGTacgt"
     n = len(seq)
     channels = 5 if include_unknown else 4
-    out = torch.zeros((channels, n), dtype=torch.float32)
-    # Vectorised lookup: build a [n] index array, -1 for unknown. bytearray
-    # gives a writable buffer for frombuffer without a copy warning.
+    lut = torch.frombuffer(bytes(_ENCODER_LUT), dtype=torch.uint8)
     arr = torch.frombuffer(bytearray(seq), dtype=torch.uint8)
-    idx = torch.full((n,), -1, dtype=torch.long)
-    for base in table:  # map both cases of each base to the same channel
-        idx[arr == base] = (table.index(base)) % 4
-    known = idx >= 0
+    ch = lut[arr].to(torch.long)                 # [n], 255 for unknown
+    known = ch < 4
+
+    out = torch.zeros((channels, n), dtype=torch.float32)
     if known.any():
-        # scatter ones into the right channel for known bases
-        ch = idx[known]
+        # Scatter 1.0 into [channel, position] for known bases.
         pos = torch.where(known)[0]
-        out[ch, pos] = 1.0
+        out[ch[known], pos] = 1.0
     if include_unknown and (~known).any():
         out[4, torch.where(~known)[0]] = 1.0
     return out
+
+
+# Cap on per-process skip warnings; further failures are tallied silently.
+_SKIP_WARN_LIMIT = 10
+_skip_warn_count = 0
+
+
+def _encode_result(r, include_unknown: bool) -> dict | None:
+    """Turn one ``ConsensusResult`` into a batch dict, or return ``None`` to skip.
+
+    ``r.seq`` is ``bytes | None`` — a failed task (non error-mode) yields
+    ``None``. We skip those rather than emit an all-zero tensor that would
+    silently poison training, logging the first few with a per-process cap.
+    """
+    global _skip_warn_count
+    if r.seq is None:
+        _skip_warn_count += 1
+        if _skip_warn_count <= _SKIP_WARN_LIMIT:
+            print(
+                f"skip {r.gene_id}/{r.sample}/{r.haplotype}: {r.error or 'no sequence'}",
+                file=sys.stderr,
+            )
+        elif _skip_warn_count == _SKIP_WARN_LIMIT + 1:
+            print("... further skips suppressed", file=sys.stderr)
+        return None
+    return {
+        "gene_id": r.gene_id,
+        "sample": r.sample,
+        "haplotype": r.haplotype,
+        "seq": encode_onehot(bytes(r.seq), include_unknown),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -175,28 +223,24 @@ class ConsensusIterableDataset:
             yield from self._buffer_shuffle(it)
         else:
             for _idx, r in it:
-                yield self._encode(r)
+                d = _encode_result(r, self._include_unknown)
+                if d is not None:
+                    yield d
 
     def _buffer_shuffle(self, it) -> Iterator[dict]:
         import random
 
         buf: list[dict] = []
         for _idx, r in it:
-            buf.append(self._encode(r))
+            d = _encode_result(r, self._include_unknown)
+            if d is not None:
+                buf.append(d)
             if len(buf) >= self._shuffle_buffer:
                 i = random.randrange(len(buf))
                 yield buf.pop(i)
         while buf:
             i = random.randrange(len(buf))
             yield buf.pop(i)
-
-    def _encode(self, r) -> dict:
-        return {
-            "gene_id": r.gene_id,
-            "sample": r.sample,
-            "haplotype": r.haplotype,
-            "seq": encode_onehot(bytes(r.seq), self._include_unknown),
-        }
 
 
 # --------------------------------------------------------------------------- #
@@ -227,6 +271,7 @@ class _MultiWorkerIterableDataset:
         threads: int,
         shuffle_buffer: int = 256,
         include_unknown: bool = True,
+        prefetch_steps: int = 16,
     ):
         self.ref_path = ref_path
         self.vcfs = vcfs
@@ -234,6 +279,7 @@ class _MultiWorkerIterableDataset:
         self.threads = threads
         self.shuffle_buffer = shuffle_buffer
         self.include_unknown = include_unknown
+        self.prefetch_steps = prefetch_steps
 
     def __iter__(self) -> Iterator[dict]:
         info = _torch_worker_info()
@@ -242,30 +288,27 @@ class _MultiWorkerIterableDataset:
         # info.id. Strided (not contiguous) sharding keeps gene/sample diversity
         # high within each worker's stream.
         tasks = self.tasks[info.id :: info.num_workers] if info.num_workers > 0 else self.tasks
-        it = engine.consensus_iter(tasks, prefetch_steps=16, threads=self.threads)
-
-        # Reuse the single-process encoder + buffer-shuffle on our shard.
-        def encode(r) -> dict:
-            return {
-                "gene_id": r.gene_id,
-                "sample": r.sample,
-                "haplotype": r.haplotype,
-                "seq": encode_onehot(bytes(r.seq), self.include_unknown),
-            }
+        it = engine.consensus_iter(
+            tasks, prefetch_steps=self.prefetch_steps, threads=self.threads
+        )
 
         if self.shuffle_buffer > 1:
             import random
 
             buf: list[dict] = []
             for _idx, r in it:
-                buf.append(encode(r))
+                d = _encode_result(r, self.include_unknown)
+                if d is not None:
+                    buf.append(d)
                 if len(buf) >= self.shuffle_buffer:
                     yield buf.pop(random.randrange(len(buf)))
             while buf:
                 yield buf.pop(random.randrange(len(buf)))
         else:
             for _idx, r in it:
-                yield encode(r)
+                d = _encode_result(r, self.include_unknown)
+                if d is not None:
+                    yield d
 
 
 class _WorkerInfo:
@@ -310,10 +353,17 @@ def main(argv=None):
     p.add_argument("--samples", required=True, help="one sample name per line")
     p.add_argument("--vcf-pattern", default=VCF_PATTERN)
     p.add_argument("--mode", choices=["single", "multi"], default="single")
-    p.add_argument("--threads", type=int, default=8, help="Rust worker threads per engine")
+    p.add_argument(
+        "--threads", type=int, default=8,
+        help="Rust worker threads per engine; in multi mode total threads = threads × num_workers",
+    )
     p.add_argument("--num-workers", type=int, default=4, help="PyTorch DataLoader workers (multi mode)")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--shuffle-buffer", type=int, default=256)
+    p.add_argument(
+        "--prefetch-steps", type=int, default=16,
+        help="region groups in flight per engine (memory vs throughput)",
+    )
     p.add_argument("--limit", type=int, default=0, help="stop after N batches (0 = all)")
     p.add_argument("--no-unknown-channel", action="store_true", help="4-channel one-hot (no N row)")
     args = p.parse_args(argv)
@@ -347,16 +397,25 @@ def main(argv=None):
     if args.mode == "single":
         engine = make_engine(args.ref, args.vcf_dir, genes, args.vcf_pattern)
         ds = ConsensusIterableDataset(
-            engine, tasks, args.threads, args.shuffle_buffer, include_unknown
+            engine, tasks, args.threads, args.shuffle_buffer, include_unknown,
+            prefetch_steps=args.prefetch_steps,
         )
         loader = DataLoader(_TorchWrap(ds), batch_size=args.batch_size)
     else:
         # Each worker process builds its own engine from ref_path + vcfs paths;
         # we only resolve the paths here (no engine constructed on the main
         # process for multi mode).
+        if args.threads * args.num_workers > os.cpu_count():
+            print(
+                f"warning: multi mode spawns {args.threads} threads × {args.num_workers} "
+                f"workers = {args.threads * args.num_workers} Rust threads on "
+                f"{os.cpu_count()} cores; consider --threads ceil(cores/num_workers)",
+                file=sys.stderr,
+            )
         ds = _MultiWorkerIterableDataset(
             args.ref, _resolve_vcfs(args, genes), tasks, args.threads,
             args.shuffle_buffer, include_unknown,
+            prefetch_steps=args.prefetch_steps,
         )
         loader = DataLoader(_TorchWrap(ds), batch_size=args.batch_size, num_workers=args.num_workers)
 
