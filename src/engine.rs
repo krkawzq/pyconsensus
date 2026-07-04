@@ -64,12 +64,6 @@ struct CachedOutput {
     error: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-struct BatchTask {
-    sample_idx: usize,
-    hap: usize,
-}
-
 struct RefOnlyBatchPatch<'a> {
     idx: usize,
     rlen: usize,
@@ -101,6 +95,14 @@ enum SameLenBatchPatch<'a> {
     RefOnly(RefOnlyBatchPatch<'a>),
     Snp1(Snp1BatchPatch<'a>),
     Mnp(MnpBatchPatch<'a>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchExecutionFlavor {
+    Plain,
+    Missing { missing: u8 },
+    Absent { absent: u8 },
+    AbsentMissing { absent: u8, missing: u8 },
 }
 
 /// One produced result.
@@ -530,7 +532,7 @@ impl ConsensusEngine {
         let mut task_by_hap_sample = [vec![usize::MAX; n_samples], vec![usize::MAX; n_samples]];
         let mut active_words_by_hap = [vec![0u64; n_words], vec![0u64; n_words]];
         let mut active_word_indices_by_hap = [Vec::new(), Vec::new()];
-        let mut batch_tasks = Vec::with_capacity(group.indices.len());
+        let mut n_batch_outputs = 0usize;
         let mut output_map = Vec::with_capacity(group.indices.len());
         for &input_idx in &group.indices {
             let task = &tasks[input_idx];
@@ -558,37 +560,37 @@ impl ConsensusEngine {
             active_words_by_hap[hap_idx][word_idx] |= 1u64 << (sample_idx & 63);
             let slot = &mut task_by_hap_sample[hap_idx][sample_idx];
             let batch_idx = if *slot == usize::MAX {
-                let idx = batch_tasks.len();
+                let idx = n_batch_outputs;
                 *slot = idx;
-                batch_tasks.push(BatchTask {
-                    sample_idx,
-                    hap: hap as usize,
-                });
+                n_batch_outputs += 1;
                 idx
             } else {
                 *slot
             };
             output_map.push((input_idx, batch_idx));
         }
-        if batch_tasks.is_empty() {
+        if n_batch_outputs == 0 {
             return None;
         }
 
         let mut patches = Vec::with_capacity(records.len());
         let mut frz_pos = -1i64;
-        for rec in records.iter() {
-            if rec.alleles.len() == 1 {
+        for rec_idx in records.iter_indices()? {
+            let (pos, rlen_i32, ref_end) = vcf.compiled_span(rec_idx)?;
+            let n_alleles = vcf.compiled_n_alleles(rec_idx)?;
+            if n_alleles == 1 {
                 if self.opts.absent.is_none() {
                     continue;
                 }
-                if rec.pos <= frz_pos || rec.rlen <= 0 {
+                if pos <= frz_pos || rlen_i32 <= 0 {
                     return None;
                 }
-                let rlen = rec.rlen as usize;
-                if rec.alleles[0].len() != rlen {
+                let rlen = rlen_i32 as usize;
+                let ref_allele = vcf.compiled_allele(rec_idx, 0)?;
+                if ref_allele.len() != rlen {
                     return None;
                 }
-                let idx = rec.pos - ori_pos;
+                let idx = pos - ori_pos;
                 if idx < 0 {
                     return None;
                 }
@@ -596,48 +598,47 @@ impl ConsensusEngine {
                 if idx + rlen > base_ref.len() {
                     return None;
                 }
-                if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+                if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
                     return None;
                 }
-                let ref_case_flags = rec
-                    .compiled
-                    .allele_op(0)
+                let ref_case_flags = vcf
+                    .compiled_allele_op(rec_idx, 0)
                     .map(|op| op.case_flags)
-                    .unwrap_or_else(|| allele_case_flags(&rec.alleles[0]));
+                    .unwrap_or_else(|| allele_case_flags(ref_allele));
                 let to_upper = base_ref[idx].is_ascii_uppercase();
                 patches.push(SameLenBatchPatch::RefOnly(RefOnlyBatchPatch {
                     idx,
                     rlen,
-                    ref_allele: &rec.alleles[0],
+                    ref_allele,
                     ref_case_flags,
                     ref_out: snp1_alt_with_case_and_mark(
-                        rec.alleles[0][0],
-                        rec.alleles[0][0],
+                        ref_allele[0],
+                        ref_allele[0],
                         to_upper,
                         ref_case_flags,
                         None,
                     ),
                     to_upper,
                 }));
-                frz_pos = rec.ref_end();
+                frz_pos = ref_end;
                 continue;
             }
-            if rec.pos <= frz_pos
-                || rec.rlen <= 0
-                || !rec.compiled.flags.contains(RecordFlags::BIALLELIC)
-                || !rec.compiled.flags.contains(RecordFlags::ALL_ALT_SAME_LEN)
+            let flags = vcf.compiled_flags(rec_idx)?;
+            if pos <= frz_pos
+                || rlen_i32 <= 0
+                || !flags.contains(RecordFlags::BIALLELIC)
+                || !flags.contains(RecordFlags::ALL_ALT_SAME_LEN)
             {
                 return None;
             }
-            let gt_bits = rec.gt_bits.as_ref()?;
-            let rlen = rec.rlen as usize;
-            if rec.alleles.len() != 2
-                || rec.alleles[0].len() != rlen
-                || rec.alleles[1].len() != rlen
-            {
+            let gt_bits = vcf.compiled_gt_bits(rec_idx)?;
+            let rlen = rlen_i32 as usize;
+            let ref_allele = vcf.compiled_allele(rec_idx, 0)?;
+            let alt_allele = vcf.compiled_allele(rec_idx, 1)?;
+            if n_alleles != 2 || ref_allele.len() != rlen || alt_allele.len() != rlen {
                 return None;
             }
-            let idx = rec.pos - ori_pos;
+            let idx = pos - ori_pos;
             if idx < 0 {
                 return None;
             }
@@ -645,23 +646,21 @@ impl ConsensusEngine {
             if idx + rlen > base_ref.len() {
                 return None;
             }
-            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(&rec.alleles[0]) {
+            if !base_ref[idx..idx + rlen].eq_ignore_ascii_case(ref_allele) {
                 return None;
             }
-            let ref_case_flags = rec
-                .compiled
-                .allele_op(0)
+            let ref_case_flags = vcf
+                .compiled_allele_op(rec_idx, 0)
                 .map(|op| op.case_flags)
-                .unwrap_or_else(|| allele_case_flags(&rec.alleles[0]));
-            let alt_case_flags = rec
-                .compiled
-                .allele_op(1)
+                .unwrap_or_else(|| allele_case_flags(ref_allele));
+            let alt_case_flags = vcf
+                .compiled_allele_op(rec_idx, 1)
                 .map(|op| op.case_flags)
-                .unwrap_or_else(|| allele_case_flags(&rec.alleles[1]));
+                .unwrap_or_else(|| allele_case_flags(alt_allele));
             let to_upper = base_ref[idx].is_ascii_uppercase();
             if rlen == 1 {
-                let ref_base = rec.alleles[0][0];
-                let alt_base = rec.alleles[1][0];
+                let ref_base = ref_allele[0];
+                let alt_base = alt_allele[0];
                 patches.push(SameLenBatchPatch::Snp1(Snp1BatchPatch {
                     idx,
                     ref_out: snp1_alt_with_case_and_mark(
@@ -684,156 +683,75 @@ impl ConsensusEngine {
                 patches.push(SameLenBatchPatch::Mnp(MnpBatchPatch {
                     idx,
                     rlen,
-                    ref_allele: &rec.alleles[0],
+                    ref_allele,
                     ref_case_flags,
-                    alt: &rec.alleles[1],
+                    alt: alt_allele,
                     alt_case_flags,
                     gt_bits,
                     to_upper,
                 }));
             }
-            frz_pos = rec.ref_end();
+            frz_pos = ref_end;
         }
         if patches.is_empty() {
             return None;
         }
 
-        if let Some(out) = self.try_run_biallelic_phased_alt_only_batch(
-            tasks,
-            base_ref,
-            &output_map,
-            &task_by_hap_sample,
-            &active_words_by_hap,
-            &active_word_indices_by_hap,
-            &patches,
-        ) {
-            return Some(out);
+        match self.biallelic_batch_flavor() {
+            BatchExecutionFlavor::Plain => self.try_run_biallelic_phased_alt_only_batch(
+                tasks,
+                base_ref,
+                &output_map,
+                &task_by_hap_sample,
+                &active_words_by_hap,
+                &active_word_indices_by_hap,
+                &patches,
+            ),
+            BatchExecutionFlavor::Missing { missing } => self
+                .try_run_biallelic_phased_missing_batch(
+                    tasks,
+                    base_ref,
+                    &output_map,
+                    &task_by_hap_sample,
+                    &active_words_by_hap,
+                    &active_word_indices_by_hap,
+                    &patches,
+                    missing,
+                ),
+            BatchExecutionFlavor::Absent { absent } => self.try_run_biallelic_phased_absent_batch(
+                tasks,
+                base_ref,
+                &output_map,
+                &task_by_hap_sample,
+                &active_words_by_hap,
+                &active_word_indices_by_hap,
+                &patches,
+                absent,
+            ),
+            BatchExecutionFlavor::AbsentMissing { absent, missing } => self
+                .try_run_biallelic_phased_absent_missing_batch(
+                    tasks,
+                    base_ref,
+                    &output_map,
+                    &task_by_hap_sample,
+                    &active_words_by_hap,
+                    &active_word_indices_by_hap,
+                    &patches,
+                    absent,
+                    missing,
+                ),
         }
-        if let Some(out) = self.try_run_biallelic_phased_missing_batch(
-            tasks,
-            base_ref,
-            &output_map,
-            &task_by_hap_sample,
-            &active_words_by_hap,
-            &active_word_indices_by_hap,
-            &patches,
-        ) {
-            return Some(out);
-        }
-        if let Some(out) = self.try_run_biallelic_phased_absent_batch(
-            tasks,
-            base_ref,
-            &output_map,
-            &task_by_hap_sample,
-            &active_words_by_hap,
-            &active_word_indices_by_hap,
-            &patches,
-        ) {
-            return Some(out);
-        }
+    }
 
-        let mut buffers: Vec<Vec<u8>> = match self.opts.absent {
-            Some(absent) => batch_tasks
-                .iter()
-                .map(|_| vec![absent; base_ref.len()])
-                .collect(),
-            None => batch_tasks.iter().map(|_| base_ref.to_vec()).collect(),
-        };
-        for patch in &patches {
-            match patch {
-                SameLenBatchPatch::RefOnly(patch) => {
-                    if self.opts.absent.is_none() {
-                        continue;
-                    }
-                    for buf in &mut buffers {
-                        if patch.rlen == 1 {
-                            buf[patch.idx] = patch.ref_out;
-                        } else {
-                            let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
-                            copy_alt_with_case_flags(
-                                dst,
-                                patch.ref_allele,
-                                patch.to_upper,
-                                patch.ref_case_flags,
-                            );
-                        }
-                    }
-                }
-                SameLenBatchPatch::Snp1(patch) => {
-                    for (task_i, task) in batch_tasks.iter().enumerate() {
-                        let buf = &mut buffers[task_i];
-                        match patch.gt_bits.allele_for_hap(task.sample_idx, task.hap)? {
-                            Some(0) if self.opts.absent.is_some() => {
-                                buf[patch.idx] = patch.ref_out;
-                            }
-                            Some(0) => {}
-                            Some(1) => {
-                                buf[patch.idx] = patch.alt_out;
-                            }
-                            None => {
-                                if let Some(missing) = self.opts.missing {
-                                    buf[patch.idx] = missing;
-                                }
-                            }
-                            _ => return None,
-                        }
-                    }
-                }
-                SameLenBatchPatch::Mnp(patch) => {
-                    for (task_i, task) in batch_tasks.iter().enumerate() {
-                        let allele =
-                            match patch.gt_bits.allele_for_hap(task.sample_idx, task.hap)? {
-                                Some(0) if self.opts.absent.is_some() => {
-                                    Some(Ok((patch.ref_allele, patch.ref_case_flags)))
-                                }
-                                Some(0) => None,
-                                Some(1) => Some(Ok((patch.alt, patch.alt_case_flags))),
-                                None => self.opts.missing.map(Err),
-                                _ => return None,
-                            };
-                        let Some(allele) = allele else { continue };
-                        let buf = &mut buffers[task_i];
-                        let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
-                        match allele {
-                            Ok((bases, case_flags)) => {
-                                copy_alt_with_case_flags(dst, bases, patch.to_upper, case_flags);
-                                if let Some(mark) = self.opts.mark_snv {
-                                    mark_snv_in_place(patch.ref_allele, dst, mark);
-                                }
-                            }
-                            Err(missing) => dst.fill(missing),
-                        }
-                    }
-                }
+    fn biallelic_batch_flavor(&self) -> BatchExecutionFlavor {
+        match (self.opts.absent, self.opts.missing) {
+            (None, None) => BatchExecutionFlavor::Plain,
+            (None, Some(missing)) => BatchExecutionFlavor::Missing { missing },
+            (Some(absent), None) => BatchExecutionFlavor::Absent { absent },
+            (Some(absent), Some(missing)) => {
+                BatchExecutionFlavor::AbsentMissing { absent, missing }
             }
         }
-
-        let mut remaining = vec![0usize; buffers.len()];
-        for &(_, batch_idx) in &output_map {
-            remaining[batch_idx] += 1;
-        }
-        let mut out = Vec::with_capacity(output_map.len());
-        for (input_idx, batch_idx) in output_map {
-            let src_task = &tasks[input_idx];
-            remaining[batch_idx] -= 1;
-            let seq = if remaining[batch_idx] == 0 {
-                std::mem::take(&mut buffers[batch_idx])
-            } else {
-                buffers[batch_idx].clone()
-            };
-            out.push((
-                input_idx,
-                ConsensusResult {
-                    gene_id: src_task.gene_id.clone(),
-                    sample: src_task.sample.clone(),
-                    haplotype: src_task.haplotype.clone(),
-                    seq,
-                    chain: None,
-                    error: None,
-                },
-            ));
-        }
-        Some(out)
     }
 
     fn try_run_biallelic_phased_alt_only_batch(
@@ -846,14 +764,10 @@ impl ConsensusEngine {
         active_word_indices_by_hap: &[Vec<usize>; 2],
         patches: &[SameLenBatchPatch<'_>],
     ) -> Option<Vec<(usize, ConsensusResult)>> {
-        if self.opts.absent.is_some() || self.opts.missing.is_some() || output_map.is_empty() {
+        if output_map.is_empty() {
             return None;
         }
-        let n_buffers = output_map
-            .iter()
-            .map(|&(_, batch_idx)| batch_idx)
-            .max()
-            .map(|idx| idx + 1)?;
+        let n_buffers = batch_buffer_count(output_map)?;
         let mut buffers: Vec<Vec<u8>> = (0..n_buffers).map(|_| base_ref.to_vec()).collect();
         for patch in patches {
             match patch {
@@ -913,32 +827,7 @@ impl ConsensusEngine {
             }
         }
 
-        let mut remaining = vec![0usize; buffers.len()];
-        for &(_, batch_idx) in output_map {
-            remaining[batch_idx] += 1;
-        }
-        let mut out = Vec::with_capacity(output_map.len());
-        for &(input_idx, batch_idx) in output_map {
-            let src_task = &tasks[input_idx];
-            remaining[batch_idx] -= 1;
-            let seq = if remaining[batch_idx] == 0 {
-                std::mem::take(&mut buffers[batch_idx])
-            } else {
-                buffers[batch_idx].clone()
-            };
-            out.push((
-                input_idx,
-                ConsensusResult {
-                    gene_id: src_task.gene_id.clone(),
-                    sample: src_task.sample.clone(),
-                    haplotype: src_task.haplotype.clone(),
-                    seq,
-                    chain: None,
-                    error: None,
-                },
-            ));
-        }
-        Some(out)
+        Some(finish_batch_outputs(tasks, output_map, buffers))
     }
 
     fn try_run_biallelic_phased_missing_batch(
@@ -950,16 +839,12 @@ impl ConsensusEngine {
         active_words_by_hap: &[Vec<u64>; 2],
         active_word_indices_by_hap: &[Vec<usize>; 2],
         patches: &[SameLenBatchPatch<'_>],
+        missing: u8,
     ) -> Option<Vec<(usize, ConsensusResult)>> {
-        let missing = self.opts.missing?;
-        if self.opts.absent.is_some() || output_map.is_empty() {
+        if output_map.is_empty() {
             return None;
         }
-        let n_buffers = output_map
-            .iter()
-            .map(|&(_, batch_idx)| batch_idx)
-            .max()
-            .map(|idx| idx + 1)?;
+        let n_buffers = batch_buffer_count(output_map)?;
         let mut buffers: Vec<Vec<u8>> = (0..n_buffers).map(|_| base_ref.to_vec()).collect();
         for patch in patches {
             match patch {
@@ -1048,32 +933,7 @@ impl ConsensusEngine {
             }
         }
 
-        let mut remaining = vec![0usize; buffers.len()];
-        for &(_, batch_idx) in output_map {
-            remaining[batch_idx] += 1;
-        }
-        let mut out = Vec::with_capacity(output_map.len());
-        for &(input_idx, batch_idx) in output_map {
-            let src_task = &tasks[input_idx];
-            remaining[batch_idx] -= 1;
-            let seq = if remaining[batch_idx] == 0 {
-                std::mem::take(&mut buffers[batch_idx])
-            } else {
-                buffers[batch_idx].clone()
-            };
-            out.push((
-                input_idx,
-                ConsensusResult {
-                    gene_id: src_task.gene_id.clone(),
-                    sample: src_task.sample.clone(),
-                    haplotype: src_task.haplotype.clone(),
-                    seq,
-                    chain: None,
-                    error: None,
-                },
-            ));
-        }
-        Some(out)
+        Some(finish_batch_outputs(tasks, output_map, buffers))
     }
 
     fn try_run_biallelic_phased_absent_batch(
@@ -1085,16 +945,149 @@ impl ConsensusEngine {
         active_words_by_hap: &[Vec<u64>; 2],
         active_word_indices_by_hap: &[Vec<usize>; 2],
         patches: &[SameLenBatchPatch<'_>],
+        absent: u8,
     ) -> Option<Vec<(usize, ConsensusResult)>> {
-        let absent = self.opts.absent?;
         if output_map.is_empty() {
             return None;
         }
-        let n_buffers = output_map
-            .iter()
-            .map(|&(_, batch_idx)| batch_idx)
-            .max()
-            .map(|idx| idx + 1)?;
+        let n_buffers = batch_buffer_count(output_map)?;
+        let mut buffers: Vec<Vec<u8>> = (0..n_buffers)
+            .map(|_| vec![absent; base_ref.len()])
+            .collect();
+
+        for patch in patches {
+            match patch {
+                SameLenBatchPatch::RefOnly(patch) => {
+                    for buf in &mut buffers {
+                        if patch.rlen == 1 {
+                            buf[patch.idx] = patch.ref_out;
+                        } else {
+                            let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
+                            copy_alt_with_case_flags(
+                                dst,
+                                patch.ref_allele,
+                                patch.to_upper,
+                                patch.ref_case_flags,
+                            );
+                        }
+                    }
+                }
+                SameLenBatchPatch::Snp1(patch) => {
+                    for hap in 1..=2 {
+                        let task_by_sample = &task_by_hap_sample[hap - 1];
+                        let active_words = &active_words_by_hap[hap - 1];
+                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
+                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
+                        let missing_words = patch.gt_bits.missing_words();
+                        for &word_idx in active_word_indices {
+                            let active = active_words[word_idx];
+                            let alt_bits = *alt_words.get(word_idx)? & active;
+                            let missing_bits = *missing_words.get(word_idx)? & active;
+
+                            let mut ref_bits = active & !(alt_bits | missing_bits);
+                            while ref_bits != 0 {
+                                let bit_idx = ref_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    buffers[task_idx][patch.idx] = patch.ref_out;
+                                }
+                                ref_bits &= ref_bits - 1;
+                            }
+
+                            let mut alt_bits = alt_bits;
+                            while alt_bits != 0 {
+                                let bit_idx = alt_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    buffers[task_idx][patch.idx] = patch.alt_out;
+                                }
+                                alt_bits &= alt_bits - 1;
+                            }
+                        }
+                    }
+                }
+                SameLenBatchPatch::Mnp(patch) => {
+                    for hap in 1..=2 {
+                        let task_by_sample = &task_by_hap_sample[hap - 1];
+                        let active_words = &active_words_by_hap[hap - 1];
+                        let active_word_indices = &active_word_indices_by_hap[hap - 1];
+                        let alt_words = patch.gt_bits.alt_words_for_hap(hap)?;
+                        let missing_words = patch.gt_bits.missing_words();
+                        for &word_idx in active_word_indices {
+                            let active = active_words[word_idx];
+                            let alt_bits = *alt_words.get(word_idx)? & active;
+                            let missing_bits = *missing_words.get(word_idx)? & active;
+
+                            let mut ref_bits = active & !(alt_bits | missing_bits);
+                            while ref_bits != 0 {
+                                let bit_idx = ref_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    let buf = &mut buffers[task_idx];
+                                    let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
+                                    copy_alt_with_case_flags(
+                                        dst,
+                                        patch.ref_allele,
+                                        patch.to_upper,
+                                        patch.ref_case_flags,
+                                    );
+                                }
+                                ref_bits &= ref_bits - 1;
+                            }
+
+                            let mut alt_bits = alt_bits;
+                            while alt_bits != 0 {
+                                let bit_idx = alt_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    let buf = &mut buffers[task_idx];
+                                    let dst = &mut buf[patch.idx..patch.idx + patch.rlen];
+                                    copy_alt_with_case_flags(
+                                        dst,
+                                        patch.alt,
+                                        patch.to_upper,
+                                        patch.alt_case_flags,
+                                    );
+                                    if let Some(mark) = self.opts.mark_snv {
+                                        mark_snv_in_place(patch.ref_allele, dst, mark);
+                                    }
+                                }
+                                alt_bits &= alt_bits - 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(finish_batch_outputs(tasks, output_map, buffers))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_run_biallelic_phased_absent_missing_batch(
+        &self,
+        tasks: &[ConsensusTask],
+        base_ref: &[u8],
+        output_map: &[(usize, usize)],
+        task_by_hap_sample: &[Vec<usize>; 2],
+        active_words_by_hap: &[Vec<u64>; 2],
+        active_word_indices_by_hap: &[Vec<usize>; 2],
+        patches: &[SameLenBatchPatch<'_>],
+        absent: u8,
+        missing: u8,
+    ) -> Option<Vec<(usize, ConsensusResult)>> {
+        if output_map.is_empty() {
+            return None;
+        }
+        let n_buffers = batch_buffer_count(output_map)?;
         let mut buffers: Vec<Vec<u8>> = (0..n_buffers)
             .map(|_| vec![absent; base_ref.len()])
             .collect();
@@ -1152,18 +1145,16 @@ impl ConsensusEngine {
                                 alt_bits &= alt_bits - 1;
                             }
 
-                            if let Some(missing) = self.opts.missing {
-                                let mut missing_bits = missing_bits;
-                                while missing_bits != 0 {
-                                    let bit_idx = missing_bits.trailing_zeros() as usize;
-                                    let sample_idx = word_idx * 64 + bit_idx;
-                                    let task_idx = task_by_sample[sample_idx];
-                                    debug_assert_ne!(task_idx, usize::MAX);
-                                    if task_idx != usize::MAX {
-                                        buffers[task_idx][patch.idx] = missing;
-                                    }
-                                    missing_bits &= missing_bits - 1;
+                            let mut missing_bits = missing_bits;
+                            while missing_bits != 0 {
+                                let bit_idx = missing_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    buffers[task_idx][patch.idx] = missing;
                                 }
+                                missing_bits &= missing_bits - 1;
                             }
                         }
                     }
@@ -1221,19 +1212,17 @@ impl ConsensusEngine {
                                 alt_bits &= alt_bits - 1;
                             }
 
-                            if let Some(missing) = self.opts.missing {
-                                let mut missing_bits = missing_bits;
-                                while missing_bits != 0 {
-                                    let bit_idx = missing_bits.trailing_zeros() as usize;
-                                    let sample_idx = word_idx * 64 + bit_idx;
-                                    let task_idx = task_by_sample[sample_idx];
-                                    debug_assert_ne!(task_idx, usize::MAX);
-                                    if task_idx != usize::MAX {
-                                        let buf = &mut buffers[task_idx];
-                                        buf[patch.idx..patch.idx + patch.rlen].fill(missing);
-                                    }
-                                    missing_bits &= missing_bits - 1;
+                            let mut missing_bits = missing_bits;
+                            while missing_bits != 0 {
+                                let bit_idx = missing_bits.trailing_zeros() as usize;
+                                let sample_idx = word_idx * 64 + bit_idx;
+                                let task_idx = task_by_sample[sample_idx];
+                                debug_assert_ne!(task_idx, usize::MAX);
+                                if task_idx != usize::MAX {
+                                    let buf = &mut buffers[task_idx];
+                                    buf[patch.idx..patch.idx + patch.rlen].fill(missing);
                                 }
+                                missing_bits &= missing_bits - 1;
                             }
                         }
                     }
@@ -1241,32 +1230,7 @@ impl ConsensusEngine {
             }
         }
 
-        let mut remaining = vec![0usize; buffers.len()];
-        for &(_, batch_idx) in output_map {
-            remaining[batch_idx] += 1;
-        }
-        let mut out = Vec::with_capacity(output_map.len());
-        for &(input_idx, batch_idx) in output_map {
-            let src_task = &tasks[input_idx];
-            remaining[batch_idx] -= 1;
-            let seq = if remaining[batch_idx] == 0 {
-                std::mem::take(&mut buffers[batch_idx])
-            } else {
-                buffers[batch_idx].clone()
-            };
-            out.push((
-                input_idx,
-                ConsensusResult {
-                    gene_id: src_task.gene_id.clone(),
-                    sample: src_task.sample.clone(),
-                    haplotype: src_task.haplotype.clone(),
-                    seq,
-                    chain: None,
-                    error: None,
-                },
-            ));
-        }
-        Some(out)
+        Some(finish_batch_outputs(tasks, output_map, buffers))
     }
 
     fn plan_options(&self) -> PlanOptions {
@@ -1290,8 +1254,8 @@ impl ConsensusEngine {
         if opts.mask_skips_variants {
             opts.mask_overlaps_variant = self.mask.as_ref().is_some_and(|mask| {
                 records
-                    .iter()
-                    .any(|rec| mask.overlaps(chr, rec.pos, rec.ref_end()))
+                    .iter_spans()
+                    .any(|span| mask.overlaps(chr, span.pos, span.ref_end))
             });
         }
         opts
@@ -1684,6 +1648,50 @@ fn result_from_cached(task: &ConsensusTask, cached: &CachedOutput) -> ConsensusR
     }
 }
 
+#[inline]
+fn batch_buffer_count(output_map: &[(usize, usize)]) -> Option<usize> {
+    output_map
+        .iter()
+        .map(|&(_, batch_idx)| batch_idx)
+        .max()
+        .map(|idx| idx + 1)
+}
+
+fn finish_batch_outputs(
+    tasks: &[ConsensusTask],
+    output_map: &[(usize, usize)],
+    mut buffers: Vec<Vec<u8>>,
+) -> Vec<(usize, ConsensusResult)> {
+    let mut remaining = vec![0usize; buffers.len()];
+    for &(_, batch_idx) in output_map {
+        debug_assert!(batch_idx < buffers.len());
+        remaining[batch_idx] += 1;
+    }
+
+    let mut out = Vec::with_capacity(output_map.len());
+    for &(input_idx, batch_idx) in output_map {
+        let src_task = &tasks[input_idx];
+        remaining[batch_idx] -= 1;
+        let seq = if remaining[batch_idx] == 0 {
+            std::mem::take(&mut buffers[batch_idx])
+        } else {
+            buffers[batch_idx].clone()
+        };
+        out.push((
+            input_idx,
+            ConsensusResult {
+                gene_id: src_task.gene_id.clone(),
+                sample: src_task.sample.clone(),
+                haplotype: src_task.haplotype.clone(),
+                seq,
+                chain: None,
+                error: None,
+            },
+        ));
+    }
+    out
+}
+
 fn copy_alt_with_case_flags(dst: &mut [u8], alt: &[u8], to_upper: bool, case_flags: u8) {
     debug_assert_eq!(dst.len(), alt.len());
     if to_upper {
@@ -1988,6 +1996,48 @@ mod tests {
         assert_eq!(parse_haplotype_index_no_alloc("R"), None);
         assert_eq!(parse_haplotype_index_no_alloc("0"), None);
         assert_eq!(parse_haplotype_index_no_alloc("1x"), None);
+    }
+
+    #[test]
+    fn biallelic_batch_flavor_specializes_option_combinations() {
+        let (ref_fa, _vcf) = setup("batch_flavor");
+        let new_engine = |opts: EngineOptions| {
+            ConsensusEngine::new(RefIndex::load(&ref_fa).unwrap(), HashMap::new(), opts)
+        };
+
+        let engine = new_engine(EngineOptions::default());
+        assert_eq!(engine.biallelic_batch_flavor(), BatchExecutionFlavor::Plain);
+
+        let engine = new_engine(EngineOptions {
+            missing: Some(b'N'),
+            ..Default::default()
+        });
+        assert_eq!(
+            engine.biallelic_batch_flavor(),
+            BatchExecutionFlavor::Missing { missing: b'N' }
+        );
+
+        let engine = new_engine(EngineOptions {
+            absent: Some(b'-'),
+            ..Default::default()
+        });
+        assert_eq!(
+            engine.biallelic_batch_flavor(),
+            BatchExecutionFlavor::Absent { absent: b'-' }
+        );
+
+        let engine = new_engine(EngineOptions {
+            absent: Some(b'-'),
+            missing: Some(b'N'),
+            ..Default::default()
+        });
+        assert_eq!(
+            engine.biallelic_batch_flavor(),
+            BatchExecutionFlavor::AbsentMissing {
+                absent: b'-',
+                missing: b'N'
+            }
+        );
     }
 
     #[test]

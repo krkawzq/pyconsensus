@@ -51,6 +51,18 @@ pub struct ApplyOptions {
     pub mask: Option<Arc<Mask>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyExecutionFlavor {
+    Plain,
+    WithMissing,
+    WithAbsent,
+    WithMaskChar,
+    WithMaskCase,
+    WithMark,
+    WithChain,
+    FullGeneral,
+}
+
 impl ApplyOptions {
     /// The M2 default: no sample, no `-I` → apply the first ALT.
     pub fn apply_all_alt() -> Self {
@@ -58,6 +70,43 @@ impl ApplyOptions {
             sample_mode: SampleMode::ApplyAllAlt,
             ..Default::default()
         }
+    }
+
+    fn execution_flavor(&self, chain_enabled: bool) -> ApplyExecutionFlavor {
+        if chain_enabled {
+            return ApplyExecutionFlavor::WithChain;
+        }
+        let has_mark =
+            self.mark_del.is_some() || self.mark_ins.is_some() || self.mark_snv.is_some();
+        let has_absent = self.absent_allele.is_some();
+        let has_missing = self.missing_allele.is_some();
+        let has_mask = self.mask.is_some();
+        let feature_count = has_mark as u8 + has_absent as u8 + has_missing as u8 + has_mask as u8;
+        if feature_count > 1 {
+            return ApplyExecutionFlavor::FullGeneral;
+        }
+        if has_mark {
+            return ApplyExecutionFlavor::WithMark;
+        }
+        if let Some(mask) = &self.mask {
+            return if mask.with.skips_variants() {
+                ApplyExecutionFlavor::WithMaskChar
+            } else {
+                ApplyExecutionFlavor::WithMaskCase
+            };
+        }
+        if has_absent {
+            ApplyExecutionFlavor::WithAbsent
+        } else if has_missing {
+            ApplyExecutionFlavor::WithMissing
+        } else {
+            ApplyExecutionFlavor::Plain
+        }
+    }
+
+    #[inline]
+    fn is_plain_apply_all_alt(&self, flavor: ApplyExecutionFlavor) -> bool {
+        flavor == ApplyExecutionFlavor::Plain && matches!(self.sample_mode, SampleMode::ApplyAllAlt)
     }
 }
 
@@ -148,11 +197,18 @@ pub fn apply_region_planned_set(
     }
 
     let mut chain_opt = chain;
+    let flavor = opts.execution_flavor(chain_opt.is_some());
     match plan.map(|p| p.lane) {
         Some(FastPathLane::SameLenOnly) => {
-            if let Some(state) =
-                try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, plan)
-            {
+            if let Some(state) = try_apply_same_len_region(
+                chr,
+                ref_seq.as_slice(),
+                ori_pos,
+                records,
+                opts,
+                flavor,
+                plan,
+            ) {
                 return state;
             }
         }
@@ -163,6 +219,7 @@ pub fn apply_region_planned_set(
                 ori_pos,
                 records,
                 opts,
+                flavor,
                 plan,
                 chain_opt.as_deref_mut(),
             ) {
@@ -171,9 +228,15 @@ pub fn apply_region_planned_set(
         }
         Some(FastPathLane::FallbackStateMachine) => {}
         _ => {
-            if let Some(state) =
-                try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, plan)
-            {
+            if let Some(state) = try_apply_same_len_region(
+                chr,
+                ref_seq.as_slice(),
+                ori_pos,
+                records,
+                opts,
+                flavor,
+                plan,
+            ) {
                 return state;
             }
             if let Some((state, _lane)) = try_apply_edit_script_region(
@@ -182,6 +245,7 @@ pub fn apply_region_planned_set(
                 ori_pos,
                 records,
                 opts,
+                flavor,
                 plan,
                 chain_opt.as_deref_mut(),
             ) {
@@ -244,9 +308,16 @@ pub fn apply_region_with_stats_set(
         return apply_empty_region(chr, ref_seq, ori_pos, opts);
     }
 
-    if let Some(state) =
-        try_apply_same_len_region(chr, ref_seq.as_slice(), ori_pos, records, opts, None)
-    {
+    let flavor = opts.execution_flavor(false);
+    if let Some(state) = try_apply_same_len_region(
+        chr,
+        ref_seq.as_slice(),
+        ori_pos,
+        records,
+        opts,
+        flavor,
+        None,
+    ) {
         stats.observe_lane(FastPathLane::SameLenOnly);
         for _ in 0..state.napplied {
             stats.observe_same_len_fastpath();
@@ -254,9 +325,16 @@ pub fn apply_region_with_stats_set(
         return state;
     }
 
-    if let Some((state, lane)) =
-        try_apply_edit_script_region(chr, ref_seq.as_slice(), ori_pos, records, opts, None, None)
-    {
+    if let Some((state, lane)) = try_apply_edit_script_region(
+        chr,
+        ref_seq.as_slice(),
+        ori_pos,
+        records,
+        opts,
+        flavor,
+        None,
+        None,
+    ) {
         stats.observe_lane(lane);
         for _ in 0..state.napplied {
             stats.observe_edit_script_fastpath();
@@ -324,6 +402,14 @@ fn select_fastpath_allele(rec: &VcfRecord, opts: &ApplyOptions) -> Option<FastSe
         });
     }
 
+    if let SampleMode::SingleSample { idx, spec } = &opts.sample_mode {
+        if let Some(selection) =
+            select_biallelic_hap_fastpath(rec, *idx, spec.haplotype, opts.missing_allele)
+        {
+            return Some(selection);
+        }
+    }
+
     let selection = select_allele(rec, &opts.sample_mode, opts.missing_allele);
     match selection.ialt {
         None => Some(FastSelection::Skip),
@@ -332,6 +418,32 @@ fn select_fastpath_allele(rec: &VcfRecord, opts: &ApplyOptions) -> Option<FastSe
             alt_override: selection.alt_override,
         }),
         Some(_) => Some(FastSelection::Missing),
+    }
+}
+
+#[inline]
+fn select_biallelic_hap_fastpath(
+    rec: &VcfRecord,
+    sample_idx: i32,
+    haplotype: Option<u32>,
+    missing_allele: Option<u8>,
+) -> Option<FastSelection> {
+    if sample_idx < 0 {
+        return None;
+    }
+    let hap = haplotype? as usize;
+    if hap == 0 || hap > 2 {
+        return None;
+    }
+    let bits = rec.gt_bits.as_ref()?;
+    match bits.allele_for_hap(sample_idx as usize, hap)? {
+        Some(ialt) if ialt >= 0 => Some(FastSelection::Allele {
+            ialt: ialt as usize,
+            alt_override: None,
+        }),
+        Some(_) => None,
+        None if missing_allele.is_some() => Some(FastSelection::Missing),
+        None => Some(FastSelection::Skip),
     }
 }
 
@@ -350,8 +462,8 @@ fn mask_overlaps_records(chr: &str, records: &RecordSet<'_>, opts: &ApplyOptions
         return false;
     }
     records
-        .iter()
-        .any(|rec| mask.overlaps(chr, rec.pos, rec.ref_end()))
+        .iter_spans()
+        .any(|span| mask.overlaps(chr, span.pos, span.ref_end))
 }
 
 #[inline]
@@ -392,12 +504,13 @@ fn try_apply_same_len_region(
     ori_pos: i64,
     records: &RecordSet<'_>,
     opts: &ApplyOptions,
+    flavor: ApplyExecutionFlavor,
     plan: Option<&RegionPlan>,
 ) -> Option<ApplyState> {
     if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
         return None;
     }
-    if is_plain_apply_all_alt(opts) {
+    if opts.is_plain_apply_all_alt(flavor) {
         if let Some(state) = try_apply_snp1_plain_apply_all_alt(chr, ref_seq, ori_pos, records) {
             return Some(state);
         }
@@ -598,17 +711,6 @@ enum SameLenRegionPatch<'a> {
         rlen: usize,
         missing: u8,
     },
-}
-
-#[inline]
-fn is_plain_apply_all_alt(opts: &ApplyOptions) -> bool {
-    matches!(opts.sample_mode, SampleMode::ApplyAllAlt)
-        && opts.absent_allele.is_none()
-        && opts.missing_allele.is_none()
-        && opts.mark_del.is_none()
-        && opts.mark_ins.is_none()
-        && opts.mark_snv.is_none()
-        && opts.mask.is_none()
 }
 
 fn try_apply_same_len_plain_apply_all_alt(
@@ -861,13 +963,14 @@ fn try_apply_edit_script_region(
     ori_pos: i64,
     records: &RecordSet<'_>,
     opts: &ApplyOptions,
+    flavor: ApplyExecutionFlavor,
     plan: Option<&RegionPlan>,
     chain: Option<&mut Chain>,
 ) -> Option<(ApplyState, FastPathLane)> {
     if records.is_empty() || !mask_allows_variant_fastpath(chr, records, opts, plan) {
         return None;
     }
-    if chain.is_none() && is_plain_apply_all_alt(opts) {
+    if opts.is_plain_apply_all_alt(flavor) {
         if let Some(state_and_lane) =
             try_apply_edit_script_plain_apply_all_alt(chr, ref_seq, ori_pos, records)
         {
@@ -2178,6 +2281,7 @@ fn mark_del_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::haplotype::HaplotypeSpec;
     use crate::mask::{Mask, MaskWith};
     use crate::vcf_store::VcfStore;
 
@@ -2226,6 +2330,117 @@ mod tests {
 
     /// ref = "ACGTACGT" (8 bp), 0-based positions 0..7
     const REF: &[u8] = b"ACGTACGT";
+
+    #[test]
+    fn apply_execution_flavor_specializes_simple_option_sets() {
+        assert_eq!(
+            ApplyOptions::default().execution_flavor(false),
+            ApplyExecutionFlavor::Plain
+        );
+        assert_eq!(
+            ApplyOptions::default().execution_flavor(true),
+            ApplyExecutionFlavor::WithChain
+        );
+        assert_eq!(
+            ApplyOptions {
+                missing_allele: Some(b'N'),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::WithMissing
+        );
+        assert_eq!(
+            ApplyOptions {
+                absent_allele: Some(b'-'),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::WithAbsent
+        );
+        assert_eq!(
+            ApplyOptions {
+                mark_snv: Some(b'X'),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::WithMark
+        );
+
+        let char_mask = write_mask("flavor_char_mask", "chr1\t1\t2\n");
+        assert_eq!(
+            ApplyOptions {
+                mask: Some(Arc::new(
+                    Mask::load(&char_mask, MaskWith::Char(b'N')).unwrap()
+                )),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::WithMaskChar
+        );
+
+        let case_mask = write_mask("flavor_case_mask", "chr1\t1\t2\n");
+        assert_eq!(
+            ApplyOptions {
+                mask: Some(Arc::new(Mask::load(&case_mask, MaskWith::Lc).unwrap())),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::WithMaskCase
+        );
+
+        assert_eq!(
+            ApplyOptions {
+                absent_allele: Some(b'-'),
+                missing_allele: Some(b'N'),
+                ..Default::default()
+            }
+            .execution_flavor(false),
+            ApplyExecutionFlavor::FullGeneral
+        );
+    }
+
+    #[test]
+    fn select_fastpath_allele_reads_biallelic_hap_bitset_directly() {
+        let vcf = write_vcf_gt("fast_select_bitset", "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t0|1\n");
+        let store = VcfStore::load(&vcf).unwrap();
+        let rec = &store.records()[0];
+        assert!(rec.gt_bits.is_some());
+
+        let opts = ApplyOptions {
+            sample_mode: SampleMode::SingleSample {
+                idx: 0,
+                spec: HaplotypeSpec::parse("2pIu").unwrap(),
+            },
+            ..Default::default()
+        };
+        match select_fastpath_allele(rec, &opts).unwrap() {
+            FastSelection::Allele { ialt, alt_override } => {
+                assert_eq!(ialt, 1);
+                assert!(alt_override.is_none());
+            }
+            _ => panic!("expected ALT allele selection"),
+        }
+
+        let vcf = write_vcf_gt(
+            "fast_select_bitset_missing",
+            "chr1\t2\t.\tC\tG\t.\t.\t.\tGT\t./.\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        let rec = &store.records()[0];
+        assert!(rec.gt_bits.is_some());
+        let opts = ApplyOptions {
+            missing_allele: Some(b'N'),
+            sample_mode: SampleMode::SingleSample {
+                idx: 0,
+                spec: HaplotypeSpec::parse("1").unwrap(),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_fastpath_allele(rec, &opts).unwrap(),
+            FastSelection::Missing
+        ));
+    }
 
     #[test]
     fn snp_replaces_single_base() {

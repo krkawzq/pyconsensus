@@ -88,27 +88,21 @@ pub fn plan_region_set(records: &RecordSet<'_>, opts: PlanOptions) -> RegionPlan
     let mut fallback_records = 0usize;
     let mut fallback_reasons = Vec::new();
 
-    for rec in records.iter() {
-        if rec.compiled.flags.contains(RecordFlags::HAS_SYMBOLIC) {
+    for meta in records.iter_meta() {
+        if meta.flags.contains(RecordFlags::HAS_SYMBOLIC) {
             fallback_records += 1;
             push_unique(&mut fallback_reasons, FallbackReason::SymbolicAllele);
             continue;
         }
-        if rec.compiled.flags.contains(RecordFlags::HAS_STAR) {
+        if meta.flags.contains(RecordFlags::HAS_STAR) {
             fallback_records += 1;
             push_unique(&mut fallback_reasons, FallbackReason::ComplexAllele);
             continue;
         }
 
-        if rec.compiled.kind == RecordKind::RefOnly
-            || rec.compiled.flags.contains(RecordFlags::ALL_ALT_SAME_LEN)
-        {
+        if meta.kind == RecordKind::RefOnly || meta.flags.contains(RecordFlags::ALL_ALT_SAME_LEN) {
             same_len_records += 1;
-        } else if rec
-            .compiled
-            .flags
-            .contains(RecordFlags::ALL_ALT_FASTPATH_ELIGIBLE)
-        {
+        } else if meta.flags.contains(RecordFlags::ALL_ALT_FASTPATH_ELIGIBLE) {
             edit_script_records += 1;
         } else {
             fallback_records += 1;

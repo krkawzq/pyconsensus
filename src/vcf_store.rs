@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const CVCF_MAGIC: &[u8; 8] = b"CVCF0001";
-const CVCF_VERSION: u32 = 6;
+const CVCF_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceFingerprint {
@@ -247,10 +247,18 @@ pub enum RecordSet<'a> {
     RefSlice(&'a [&'a VcfRecord]),
     IndexSlice {
         records: &'a [VcfRecord],
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
+        hot_kind: &'a [RecordKind],
+        hot_flags: &'a [RecordFlags],
         idx: &'a [u32],
     },
     IndexFilteredPrefixAndSlice {
         records: &'a [VcfRecord],
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
+        hot_kind: &'a [RecordKind],
+        hot_flags: &'a [RecordFlags],
         prefix_idx: &'a [u32],
         idx: &'a [u32],
         start: i64,
@@ -268,6 +276,8 @@ pub enum RecordSetIter<'a, 's> {
     },
     IndexFilteredPrefixAndSlice {
         records: &'a [VcfRecord],
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
         prefix_iter: std::slice::Iter<'s, u32>,
         idx_iter: std::slice::Iter<'s, u32>,
         start: i64,
@@ -275,6 +285,71 @@ pub enum RecordSetIter<'a, 's> {
         prefix_remaining: usize,
     },
     Empty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordSetMeta {
+    pub kind: RecordKind,
+    pub flags: RecordFlags,
+}
+
+pub enum RecordSetMetaIter<'a, 's> {
+    RefSlice(std::slice::Iter<'s, &'a VcfRecord>),
+    IndexSlice {
+        hot_kind: &'a [RecordKind],
+        hot_flags: &'a [RecordFlags],
+        iter: std::slice::Iter<'s, u32>,
+    },
+    IndexFilteredPrefixAndSlice {
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
+        hot_kind: &'a [RecordKind],
+        hot_flags: &'a [RecordFlags],
+        prefix_iter: std::slice::Iter<'s, u32>,
+        idx_iter: std::slice::Iter<'s, u32>,
+        start: i64,
+        end: i64,
+        prefix_remaining: usize,
+    },
+    Empty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordSetSpan {
+    pub pos: i64,
+    pub ref_end: i64,
+}
+
+pub enum RecordSetSpanIter<'a, 's> {
+    RefSlice(std::slice::Iter<'s, &'a VcfRecord>),
+    IndexSlice {
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
+        iter: std::slice::Iter<'s, u32>,
+    },
+    IndexFilteredPrefixAndSlice {
+        hot_pos: &'a [i64],
+        hot_ref_end: &'a [i64],
+        prefix_iter: std::slice::Iter<'s, u32>,
+        idx_iter: std::slice::Iter<'s, u32>,
+        start: i64,
+        end: i64,
+        prefix_remaining: usize,
+    },
+    Empty,
+}
+
+pub enum RecordSetIndexIter<'s> {
+    IndexSlice(std::slice::Iter<'s, u32>),
+    IndexFilteredPrefixAndSlice {
+        hot_pos: &'s [i64],
+        hot_ref_end: &'s [i64],
+        prefix_iter: std::slice::Iter<'s, u32>,
+        idx_iter: std::slice::Iter<'s, u32>,
+        start: i64,
+        end: i64,
+        prefix_remaining: usize,
+    },
 }
 
 impl<'a> RecordSet<'a> {
@@ -306,19 +381,24 @@ impl<'a> RecordSet<'a> {
     pub fn iter(&self) -> RecordSetIter<'a, '_> {
         match self {
             RecordSet::RefSlice(records) => RecordSetIter::RefSlice(records.iter().copied()),
-            RecordSet::IndexSlice { records, idx } => RecordSetIter::IndexSlice {
+            RecordSet::IndexSlice { records, idx, .. } => RecordSetIter::IndexSlice {
                 records,
                 iter: idx.iter(),
             },
             RecordSet::IndexFilteredPrefixAndSlice {
                 records,
+                hot_pos,
+                hot_ref_end,
                 prefix_idx,
                 idx,
                 start,
                 end,
                 prefix_len,
+                ..
             } => RecordSetIter::IndexFilteredPrefixAndSlice {
                 records,
+                hot_pos,
+                hot_ref_end,
                 prefix_iter: prefix_idx.iter(),
                 idx_iter: idx.iter(),
                 start: *start,
@@ -326,6 +406,105 @@ impl<'a> RecordSet<'a> {
                 prefix_remaining: *prefix_len,
             },
             RecordSet::Empty => RecordSetIter::Empty,
+        }
+    }
+
+    pub fn iter_meta(&self) -> RecordSetMetaIter<'a, '_> {
+        match self {
+            RecordSet::RefSlice(records) => RecordSetMetaIter::RefSlice(records.iter()),
+            RecordSet::IndexSlice {
+                hot_kind,
+                hot_flags,
+                idx,
+                ..
+            } => RecordSetMetaIter::IndexSlice {
+                hot_kind,
+                hot_flags,
+                iter: idx.iter(),
+            },
+            RecordSet::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                hot_kind,
+                hot_flags,
+                prefix_idx,
+                idx,
+                start,
+                end,
+                prefix_len,
+                ..
+            } => RecordSetMetaIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                hot_kind,
+                hot_flags,
+                prefix_iter: prefix_idx.iter(),
+                idx_iter: idx.iter(),
+                start: *start,
+                end: *end,
+                prefix_remaining: *prefix_len,
+            },
+            RecordSet::Empty => RecordSetMetaIter::Empty,
+        }
+    }
+
+    pub fn iter_spans(&self) -> RecordSetSpanIter<'a, '_> {
+        match self {
+            RecordSet::RefSlice(records) => RecordSetSpanIter::RefSlice(records.iter()),
+            RecordSet::IndexSlice {
+                idx,
+                hot_pos,
+                hot_ref_end,
+                ..
+            } => RecordSetSpanIter::IndexSlice {
+                hot_pos,
+                hot_ref_end,
+                iter: idx.iter(),
+            },
+            RecordSet::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_idx,
+                idx,
+                start,
+                end,
+                prefix_len,
+                ..
+            } => RecordSetSpanIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_iter: prefix_idx.iter(),
+                idx_iter: idx.iter(),
+                start: *start,
+                end: *end,
+                prefix_remaining: *prefix_len,
+            },
+            RecordSet::Empty => RecordSetSpanIter::Empty,
+        }
+    }
+
+    pub fn iter_indices(&self) -> Option<RecordSetIndexIter<'_>> {
+        match self {
+            RecordSet::IndexSlice { idx, .. } => Some(RecordSetIndexIter::IndexSlice(idx.iter())),
+            RecordSet::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_idx,
+                idx,
+                start,
+                end,
+                prefix_len,
+                ..
+            } => Some(RecordSetIndexIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_iter: prefix_idx.iter(),
+                idx_iter: idx.iter(),
+                start: *start,
+                end: *end,
+                prefix_remaining: *prefix_len,
+            }),
+            RecordSet::RefSlice(_) | RecordSet::Empty => None,
         }
     }
 
@@ -345,6 +524,8 @@ impl<'a> Iterator for RecordSetIter<'a, '_> {
             }
             RecordSetIter::IndexFilteredPrefixAndSlice {
                 records,
+                hot_pos,
+                hot_ref_end,
                 prefix_iter,
                 idx_iter,
                 start,
@@ -352,10 +533,10 @@ impl<'a> Iterator for RecordSetIter<'a, '_> {
                 prefix_remaining,
             } => {
                 for &i in prefix_iter.by_ref() {
-                    let rec = &records[i as usize];
-                    if rec.pos <= *end && rec.ref_end() >= *start {
+                    let i = i as usize;
+                    if hot_pos[i] <= *end && hot_ref_end[i] >= *start {
                         *prefix_remaining -= 1;
-                        return Some(rec);
+                        return Some(&records[i]);
                     }
                 }
                 *prefix_remaining = 0;
@@ -387,6 +568,204 @@ impl<'a> Iterator for RecordSetIter<'a, '_> {
 
 impl ExactSizeIterator for RecordSetIter<'_, '_> {}
 
+impl Iterator for RecordSetMetaIter<'_, '_> {
+    type Item = RecordSetMeta;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RecordSetMetaIter::RefSlice(iter) => iter.next().map(|rec| RecordSetMeta {
+                kind: rec.compiled.kind,
+                flags: rec.compiled.flags,
+            }),
+            RecordSetMetaIter::IndexSlice {
+                hot_kind,
+                hot_flags,
+                iter,
+            } => iter.next().map(|&i| {
+                let i = i as usize;
+                RecordSetMeta {
+                    kind: hot_kind[i],
+                    flags: hot_flags[i],
+                }
+            }),
+            RecordSetMetaIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                hot_kind,
+                hot_flags,
+                prefix_iter,
+                idx_iter,
+                start,
+                end,
+                prefix_remaining,
+            } => {
+                for &i in prefix_iter.by_ref() {
+                    let i = i as usize;
+                    if hot_pos[i] <= *end && hot_ref_end[i] >= *start {
+                        *prefix_remaining -= 1;
+                        return Some(RecordSetMeta {
+                            kind: hot_kind[i],
+                            flags: hot_flags[i],
+                        });
+                    }
+                }
+                *prefix_remaining = 0;
+                idx_iter.next().map(|&i| {
+                    let i = i as usize;
+                    RecordSetMeta {
+                        kind: hot_kind[i],
+                        flags: hot_flags[i],
+                    }
+                })
+            }
+            RecordSetMetaIter::Empty => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RecordSetMetaIter::RefSlice(iter) => iter.size_hint(),
+            RecordSetMetaIter::IndexSlice { iter, .. } => iter.size_hint(),
+            RecordSetMetaIter::IndexFilteredPrefixAndSlice {
+                idx_iter,
+                prefix_remaining,
+                ..
+            } => {
+                let (i_lo, i_hi) = idx_iter.size_hint();
+                (
+                    *prefix_remaining + i_lo,
+                    i_hi.map(|i| *prefix_remaining + i),
+                )
+            }
+            RecordSetMetaIter::Empty => (0, Some(0)),
+        }
+    }
+}
+
+impl ExactSizeIterator for RecordSetMetaIter<'_, '_> {}
+
+impl Iterator for RecordSetSpanIter<'_, '_> {
+    type Item = RecordSetSpan;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RecordSetSpanIter::RefSlice(iter) => iter.next().map(|rec| RecordSetSpan {
+                pos: rec.pos,
+                ref_end: rec.ref_end(),
+            }),
+            RecordSetSpanIter::IndexSlice {
+                hot_pos,
+                hot_ref_end,
+                iter,
+            } => iter.next().map(|&i| {
+                let i = i as usize;
+                RecordSetSpan {
+                    pos: hot_pos[i],
+                    ref_end: hot_ref_end[i],
+                }
+            }),
+            RecordSetSpanIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_iter,
+                idx_iter,
+                start,
+                end,
+                prefix_remaining,
+            } => {
+                for &i in prefix_iter.by_ref() {
+                    let i = i as usize;
+                    if hot_pos[i] <= *end && hot_ref_end[i] >= *start {
+                        *prefix_remaining -= 1;
+                        return Some(RecordSetSpan {
+                            pos: hot_pos[i],
+                            ref_end: hot_ref_end[i],
+                        });
+                    }
+                }
+                *prefix_remaining = 0;
+                idx_iter.next().map(|&i| {
+                    let i = i as usize;
+                    RecordSetSpan {
+                        pos: hot_pos[i],
+                        ref_end: hot_ref_end[i],
+                    }
+                })
+            }
+            RecordSetSpanIter::Empty => None,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RecordSetSpanIter::RefSlice(iter) => iter.size_hint(),
+            RecordSetSpanIter::IndexSlice { iter, .. } => iter.size_hint(),
+            RecordSetSpanIter::IndexFilteredPrefixAndSlice {
+                idx_iter,
+                prefix_remaining,
+                ..
+            } => {
+                let (i_lo, i_hi) = idx_iter.size_hint();
+                (
+                    *prefix_remaining + i_lo,
+                    i_hi.map(|i| *prefix_remaining + i),
+                )
+            }
+            RecordSetSpanIter::Empty => (0, Some(0)),
+        }
+    }
+}
+
+impl ExactSizeIterator for RecordSetSpanIter<'_, '_> {}
+
+impl Iterator for RecordSetIndexIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RecordSetIndexIter::IndexSlice(iter) => iter.next().map(|&i| i as usize),
+            RecordSetIndexIter::IndexFilteredPrefixAndSlice {
+                hot_pos,
+                hot_ref_end,
+                prefix_iter,
+                idx_iter,
+                start,
+                end,
+                prefix_remaining,
+            } => {
+                for &i in prefix_iter.by_ref() {
+                    let i = i as usize;
+                    if hot_pos[i] <= *end && hot_ref_end[i] >= *start {
+                        *prefix_remaining -= 1;
+                        return Some(i);
+                    }
+                }
+                *prefix_remaining = 0;
+                idx_iter.next().map(|&i| i as usize)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RecordSetIndexIter::IndexSlice(iter) => iter.size_hint(),
+            RecordSetIndexIter::IndexFilteredPrefixAndSlice {
+                idx_iter,
+                prefix_remaining,
+                ..
+            } => {
+                let (i_lo, i_hi) = idx_iter.size_hint();
+                (
+                    *prefix_remaining + i_lo,
+                    i_hi.map(|i| *prefix_remaining + i),
+                )
+            }
+        }
+    }
+}
+
+impl ExactSizeIterator for RecordSetIndexIter<'_> {}
+
 impl VcfRecord {
     /// 0-based inclusive end of the REF span: `pos + rlen - 1`.
     pub fn ref_end(&self) -> i64 {
@@ -404,6 +783,215 @@ impl VcfRecord {
     }
 }
 
+#[derive(Default)]
+struct RecordHotColumns {
+    pos: Vec<i64>,
+    ref_end: Vec<i64>,
+    rid: Vec<i32>,
+    var_type: Vec<i32>,
+    kind: Vec<RecordKind>,
+    flags: Vec<RecordFlags>,
+    ref_len: Vec<u32>,
+    n_alleles: Vec<u16>,
+    record_allele_offset: Vec<u32>,
+    allele_offsets: Vec<u32>,
+    allele_lens: Vec<u32>,
+    allele_bytes: Vec<u8>,
+    op_offset: Vec<u32>,
+    op_len: Vec<u16>,
+    ops: Vec<AlleleOp>,
+}
+
+impl RecordHotColumns {
+    #[inline]
+    fn push_record(&mut self, rec: &VcfRecord) {
+        self.pos.push(rec.pos);
+        self.ref_end.push(rec.ref_end());
+        self.rid.push(rec.rid);
+        self.var_type.push(rec.var_type);
+        self.kind.push(rec.compiled.kind);
+        self.flags.push(rec.compiled.flags);
+        self.ref_len.push(rec.rlen.max(0) as u32);
+        self.n_alleles
+            .push(u16::try_from(rec.alleles.len()).expect("record allele count exceeds u16"));
+
+        let allele_start =
+            u32::try_from(self.allele_offsets.len()).expect("allele offset table exceeds u32");
+        self.record_allele_offset.push(allele_start);
+        for allele in &rec.alleles {
+            let byte_offset =
+                u32::try_from(self.allele_bytes.len()).expect("allele byte pool exceeds u32");
+            self.allele_offsets.push(byte_offset);
+            self.allele_lens
+                .push(u32::try_from(allele.len()).expect("allele length exceeds u32"));
+            self.allele_bytes.extend_from_slice(allele);
+        }
+
+        self.op_offset
+            .push(u32::try_from(self.ops.len()).expect("allele op table exceeds u32"));
+        self.op_len
+            .push(u16::try_from(rec.compiled.ops.len()).expect("allele op count exceeds u16"));
+        self.ops.extend(rec.compiled.ops.iter().cloned());
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.pos.len()
+    }
+
+    #[inline]
+    fn allele(&self, record_idx: usize, allele_idx: usize) -> Option<&[u8]> {
+        let n_alleles = *self.n_alleles.get(record_idx)? as usize;
+        if allele_idx >= n_alleles {
+            return None;
+        }
+        let table_idx = *self.record_allele_offset.get(record_idx)? as usize + allele_idx;
+        let offset = *self.allele_offsets.get(table_idx)? as usize;
+        let len = *self.allele_lens.get(table_idx)? as usize;
+        self.allele_bytes.get(offset..offset + len)
+    }
+
+    #[inline]
+    fn allele_op(&self, record_idx: usize, allele_idx: usize) -> Option<&AlleleOp> {
+        let n_ops = *self.op_len.get(record_idx)? as usize;
+        if allele_idx >= n_ops {
+            return None;
+        }
+        let op_idx = *self.op_offset.get(record_idx)? as usize + allele_idx;
+        self.ops.get(op_idx)
+    }
+
+    fn alleles_owned(&self, record_idx: usize) -> io::Result<Vec<SmallVec<[u8; 16]>>> {
+        let n_alleles = *self
+            .n_alleles
+            .get(record_idx)
+            .ok_or_else(|| invalid_data("record allele count out of range"))?
+            as usize;
+        let mut alleles = Vec::with_capacity(n_alleles);
+        for allele_idx in 0..n_alleles {
+            let allele = self
+                .allele(record_idx, allele_idx)
+                .ok_or_else(|| invalid_data("record allele pool out of range"))?;
+            alleles.push(SmallVec::from_slice(allele));
+        }
+        Ok(alleles)
+    }
+
+    fn compiled_owned(&self, record_idx: usize) -> io::Result<CompiledRecord> {
+        let op_offset = *self
+            .op_offset
+            .get(record_idx)
+            .ok_or_else(|| invalid_data("record op offset out of range"))?
+            as usize;
+        let op_len = *self
+            .op_len
+            .get(record_idx)
+            .ok_or_else(|| invalid_data("record op len out of range"))?
+            as usize;
+        let ops = self
+            .ops
+            .get(op_offset..op_offset + op_len)
+            .ok_or_else(|| invalid_data("record op table out of range"))?;
+        Ok(CompiledRecord {
+            kind: *self
+                .kind
+                .get(record_idx)
+                .ok_or_else(|| invalid_data("record kind out of range"))?,
+            flags: *self
+                .flags
+                .get(record_idx)
+                .ok_or_else(|| invalid_data("record flags out of range"))?,
+            ops: ops.iter().cloned().collect(),
+        })
+    }
+
+    fn rlen_owned(&self, record_idx: usize) -> io::Result<i32> {
+        let ref_len = *self
+            .ref_len
+            .get(record_idx)
+            .ok_or_else(|| invalid_data("record ref len out of range"))?;
+        i32::try_from(ref_len).map_err(|_| invalid_data("record ref len exceeds i32"))
+    }
+
+    fn validate(&self, n_records: usize) -> io::Result<()> {
+        ensure_column_len("pos", self.pos.len(), n_records)?;
+        ensure_column_len("ref_end", self.ref_end.len(), n_records)?;
+        ensure_column_len("rid", self.rid.len(), n_records)?;
+        ensure_column_len("var_type", self.var_type.len(), n_records)?;
+        ensure_column_len("kind", self.kind.len(), n_records)?;
+        ensure_column_len("flags", self.flags.len(), n_records)?;
+        ensure_column_len("ref_len", self.ref_len.len(), n_records)?;
+        ensure_column_len("n_alleles", self.n_alleles.len(), n_records)?;
+        ensure_column_len(
+            "record_allele_offset",
+            self.record_allele_offset.len(),
+            n_records,
+        )?;
+        ensure_column_len("op_offset", self.op_offset.len(), n_records)?;
+        ensure_column_len("op_len", self.op_len.len(), n_records)?;
+        if self.allele_offsets.len() != self.allele_lens.len() {
+            return Err(invalid_data("allele offset/len table mismatch"));
+        }
+
+        let mut expected_allele_offset = 0usize;
+        let mut expected_op_offset = 0usize;
+        for record_idx in 0..n_records {
+            let ref_len = self.ref_len[record_idx] as i64;
+            let expected_ref_end = self.pos[record_idx]
+                .checked_add(ref_len)
+                .and_then(|x| x.checked_sub(1))
+                .ok_or_else(|| invalid_data("record ref_end overflow"))?;
+            if self.ref_end[record_idx] != expected_ref_end {
+                return Err(invalid_data("record ref_end/ref_len mismatch"));
+            }
+
+            let allele_offset = self.record_allele_offset[record_idx] as usize;
+            if allele_offset != expected_allele_offset {
+                return Err(invalid_data("non-contiguous allele offset table"));
+            }
+            let n_alleles = self.n_alleles[record_idx] as usize;
+            let allele_end = allele_offset
+                .checked_add(n_alleles)
+                .ok_or_else(|| invalid_data("allele table offset overflow"))?;
+            if allele_end > self.allele_offsets.len() {
+                return Err(invalid_data("record allele table out of range"));
+            }
+            for allele_idx in allele_offset..allele_end {
+                let byte_offset = self.allele_offsets[allele_idx] as usize;
+                let byte_len = self.allele_lens[allele_idx] as usize;
+                let byte_end = byte_offset
+                    .checked_add(byte_len)
+                    .ok_or_else(|| invalid_data("allele byte range overflow"))?;
+                if byte_end > self.allele_bytes.len() {
+                    return Err(invalid_data("allele byte range out of range"));
+                }
+            }
+            expected_allele_offset = allele_end;
+
+            let op_offset = self.op_offset[record_idx] as usize;
+            if op_offset != expected_op_offset {
+                return Err(invalid_data("non-contiguous allele op table"));
+            }
+            let op_len = self.op_len[record_idx] as usize;
+            let op_end = op_offset
+                .checked_add(op_len)
+                .ok_or_else(|| invalid_data("allele op table offset overflow"))?;
+            if op_end > self.ops.len() {
+                return Err(invalid_data("record allele op table out of range"));
+            }
+            expected_op_offset = op_end;
+        }
+
+        if expected_allele_offset != self.allele_offsets.len() {
+            return Err(invalid_data("unused allele table entries"));
+        }
+        if expected_op_offset != self.ops.len() {
+            return Err(invalid_data("unused allele op entries"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadStrategy {
     /// Preprocess the whole VCF into memory up front.
@@ -416,6 +1004,7 @@ pub enum LoadStrategy {
 pub struct VcfStore {
     path: PathBuf,
     records: Vec<VcfRecord>,
+    hot: RecordHotColumns,
     /// rid -> record indices sorted by pos (stable on file order).
     by_rid: HashMap<i32, Vec<u32>>,
     /// rid -> prefix-max of `ref_end` aligned with `by_rid`, so a query can
@@ -423,6 +1012,9 @@ pub struct VcfStore {
     pmax_end: HashMap<i32, Vec<i64>>,
     /// contig name -> rid
     seq_names: HashMap<String, i32>,
+    /// contig names seen in records but absent from the header; used to emit
+    /// the "not declared" warning at most once per contig (mirrors htslib).
+    undeclared_contig_warned: std::collections::HashSet<String>,
     sample_names: Vec<String>,
     /// name -> sample index
     sample_idx: HashMap<String, i32>,
@@ -459,9 +1051,11 @@ impl VcfStore {
         VcfStore {
             path,
             records: Vec::new(),
+            hot: RecordHotColumns::default(),
             by_rid: HashMap::new(),
             pmax_end: HashMap::new(),
             seq_names: HashMap::new(),
+            undeclared_contig_warned: std::collections::HashSet::new(),
             sample_names: Vec::new(),
             sample_idx: HashMap::new(),
             has_gt: false,
@@ -495,11 +1089,45 @@ impl VcfStore {
     }
 
     pub fn rid_of(&self, chr: &str) -> Option<i32> {
-        self.seq_names.get(chr).copied()
+        self.lookup_rid(chr)
     }
 
     pub fn records(&self) -> &[VcfRecord] {
         &self.records
+    }
+
+    #[inline]
+    pub fn compiled_allele(&self, record_idx: usize, allele_idx: usize) -> Option<&[u8]> {
+        self.hot.allele(record_idx, allele_idx)
+    }
+
+    #[inline]
+    pub fn compiled_allele_op(&self, record_idx: usize, allele_idx: usize) -> Option<&AlleleOp> {
+        self.hot.allele_op(record_idx, allele_idx)
+    }
+
+    #[inline]
+    pub fn compiled_n_alleles(&self, record_idx: usize) -> Option<usize> {
+        self.hot.n_alleles.get(record_idx).map(|&n| n as usize)
+    }
+
+    #[inline]
+    pub fn compiled_flags(&self, record_idx: usize) -> Option<RecordFlags> {
+        self.hot.flags.get(record_idx).copied()
+    }
+
+    #[inline]
+    pub fn compiled_span(&self, record_idx: usize) -> Option<(i64, i32, i64)> {
+        Some((
+            *self.hot.pos.get(record_idx)?,
+            i32::try_from(*self.hot.ref_len.get(record_idx)?).ok()?,
+            *self.hot.ref_end.get(record_idx)?,
+        ))
+    }
+
+    #[inline]
+    pub fn compiled_gt_bits(&self, record_idx: usize) -> Option<&BiallelicPhasedGtBits> {
+        self.records.get(record_idx)?.gt_bits.as_ref()
     }
 
     pub fn compile_stats(&self) -> &VcfCompileStats {
@@ -515,8 +1143,8 @@ impl VcfStore {
     }
 
     pub fn query_set(&self, chr: &str, start: i64, end: i64, overlap: u8) -> RecordSet<'_> {
-        let rid = match self.seq_names.get(chr) {
-            Some(r) => *r,
+        let rid = match self.lookup_rid(chr) {
+            Some(r) => r,
             None => return RecordSet::Empty,
         };
         let idx = match self.by_rid.get(&rid) {
@@ -530,11 +1158,16 @@ impl VcfStore {
             .pmax_end
             .get(&rid)
             .expect("pmax_end aligned with by_rid");
+        debug_assert_eq!(self.hot.len(), self.records.len());
+        let hot_pos = &self.hot.pos;
+        let hot_ref_end = &self.hot.ref_end;
+        let hot_kind = &self.hot.kind;
+        let hot_flags = &self.hot.flags;
 
         // hi = first index whose record.pos > end
-        let hi = idx.partition_point(|&i| self.records[i as usize].pos <= end);
+        let hi = idx.partition_point(|&i| hot_pos[i as usize] <= end);
         // lo_pos = first index whose record.pos >= start
-        let lo_pos = idx.partition_point(|&i| self.records[i as usize].pos < start);
+        let lo_pos = idx.partition_point(|&i| hot_pos[i as usize] < start);
 
         let first_spanning = if (overlap == 1 || overlap == 2) && lo_pos > 0 {
             pmax[..lo_pos].partition_point(|&m| m < start)
@@ -548,6 +1181,10 @@ impl VcfStore {
                 } else {
                     RecordSet::IndexSlice {
                         records: &self.records,
+                        hot_pos,
+                        hot_ref_end,
+                        hot_kind,
+                        hot_flags,
                         idx: &idx[lo_pos..hi],
                     }
                 }
@@ -559,6 +1196,10 @@ impl VcfStore {
                     }
                     return RecordSet::IndexSlice {
                         records: &self.records,
+                        hot_pos,
+                        hot_ref_end,
+                        hot_kind,
+                        hot_flags,
                         idx: &idx[lo_pos..hi],
                     };
                 }
@@ -566,8 +1207,8 @@ impl VcfStore {
                 let prefix_idx = &idx[first_spanning..lo_pos];
                 let mut prefix_len = 0usize;
                 for &i in prefix_idx {
-                    let rec = &self.records[i as usize];
-                    if rec.pos <= end && rec.ref_end() >= start {
+                    let i = i as usize;
+                    if hot_pos[i] <= end && hot_ref_end[i] >= start {
                         prefix_len += 1;
                     }
                 }
@@ -579,12 +1220,20 @@ impl VcfStore {
                     } else {
                         RecordSet::IndexSlice {
                             records: &self.records,
+                            hot_pos,
+                            hot_ref_end,
+                            hot_kind,
+                            hot_flags,
                             idx: tail,
                         }
                     }
                 } else {
                     RecordSet::IndexFilteredPrefixAndSlice {
                         records: &self.records,
+                        hot_pos,
+                        hot_ref_end,
+                        hot_kind,
+                        hot_flags,
                         prefix_idx,
                         idx: tail,
                         start,
@@ -595,6 +1244,26 @@ impl VcfStore {
             }
             _ => RecordSet::Empty,
         }
+    }
+
+    fn lookup_rid(&self, chr: &str) -> Option<i32> {
+        self.seq_names
+            .get(chr)
+            .copied()
+            .or_else(|| {
+                chr.strip_prefix("chr")
+                    .and_then(|name| self.seq_names.get(name).copied())
+            })
+            .or_else(|| {
+                if chr.starts_with("chr") {
+                    None
+                } else {
+                    let mut alias = String::with_capacity(chr.len() + 3);
+                    alias.push_str("chr");
+                    alias.push_str(chr);
+                    self.seq_names.get(&alias).copied()
+                }
+            })
     }
 
     pub fn plan_query(
@@ -694,47 +1363,20 @@ impl VcfStore {
         store.n_sample = read_i32(&mut r)?;
 
         let n_records = read_len64(&mut r)?;
+        store.hot = read_hot_columns(&mut r, n_records)?;
         store.records.reserve(n_records);
-        for _ in 0..n_records {
-            let pos = read_i64(&mut r)?;
-            let rlen = read_i32(&mut r)?;
-            let rid = read_i32(&mut r)?;
-            let var_type = read_i32(&mut r)?;
-
-            let n_allele = read_len(&mut r)?;
-            let mut alleles: Vec<SmallVec<[u8; 16]>> = Vec::with_capacity(n_allele);
-            for _ in 0..n_allele {
-                let bytes = read_bytes(&mut r)?;
-                alleles.push(SmallVec::from_slice(&bytes));
-            }
-            let compiled = read_compiled_record(&mut r)?;
-
-            let n_gt_samples = read_len(&mut r)?;
-            let mut gt: Vec<SmallVec<[GtAllele; 2]>> = Vec::with_capacity(n_gt_samples);
-            for _ in 0..n_gt_samples {
-                let n_gt = read_len(&mut r)?;
-                let mut sample_gt: SmallVec<[GtAllele; 2]> = SmallVec::new();
-                for _ in 0..n_gt {
-                    let has_allele = read_bool(&mut r)?;
-                    let allele = if has_allele {
-                        Some(read_i32(&mut r)?)
-                    } else {
-                        None
-                    };
-                    let phased = read_bool(&mut r)?;
-                    let raw = read_i32(&mut r)?;
-                    sample_gt.push(GtAllele {
-                        allele,
-                        phased,
-                        raw,
-                    });
-                }
-                gt.push(sample_gt);
-            }
-
+        for record_idx in 0..n_records {
+            let pos = store.hot.pos[record_idx];
+            let rlen = store.hot.rlen_owned(record_idx)?;
+            let rid = store.hot.rid[record_idx];
+            let var_type = store.hot.var_type[record_idx];
+            let alleles = store.hot.alleles_owned(record_idx)?;
+            let compiled = store.hot.compiled_owned(record_idx)?;
+            let gt = read_raw_gt(&mut r)?;
             let gt_compact = read_compact_gt(&mut r)?;
             let gt_bits = read_gt_bits(&mut r)?;
             store.compile_stats.observe_record(&compiled);
+            let n_allele = alleles.len();
             let (has_gt, is_biallelic_phased_diploid, has_missing_gt) =
                 gt_compile_stats_from_stores(n_allele, &gt, gt_compact.as_ref());
             store.compile_stats.observe_gt(
@@ -746,7 +1388,7 @@ impl VcfStore {
             );
             store.has_gt |= has_gt;
 
-            store.records.push(VcfRecord {
+            let record = VcfRecord {
                 pos,
                 rlen,
                 rid,
@@ -756,13 +1398,16 @@ impl VcfStore {
                 gt_bits,
                 var_type,
                 compiled,
-            });
+            };
+            store.records.push(record);
         }
         read_coord_index(&mut r, &mut store)?;
+        store.validate_compiled_store()?;
         Ok(store)
     }
 
     fn write_cache_file(&self, cache_path: &Path, source_fp: SourceFingerprint) -> io::Result<()> {
+        self.validate_compiled_store()?;
         let mut w = BufWriter::new(File::create(cache_path)?);
         w.write_all(CVCF_MAGIC)?;
         write_u32(&mut w, CVCF_VERSION)?;
@@ -784,30 +1429,9 @@ impl VcfStore {
         write_i32(&mut w, self.n_sample)?;
 
         write_len64(&mut w, self.records.len())?;
+        write_hot_columns(&mut w, &self.hot, self.records.len())?;
         for rec in &self.records {
-            write_i64(&mut w, rec.pos)?;
-            write_i32(&mut w, rec.rlen)?;
-            write_i32(&mut w, rec.rid)?;
-            write_i32(&mut w, rec.var_type)?;
-
-            write_len(&mut w, rec.alleles.len())?;
-            for allele in &rec.alleles {
-                write_bytes(&mut w, allele)?;
-            }
-            write_compiled_record(&mut w, &rec.compiled)?;
-
-            write_len(&mut w, rec.gt.len())?;
-            for sample_gt in &rec.gt {
-                write_len(&mut w, sample_gt.len())?;
-                for gt in sample_gt {
-                    write_bool(&mut w, gt.allele.is_some())?;
-                    if let Some(allele) = gt.allele {
-                        write_i32(&mut w, allele)?;
-                    }
-                    write_bool(&mut w, gt.phased)?;
-                    write_i32(&mut w, gt.raw)?;
-                }
-            }
+            write_raw_gt(&mut w, &rec.gt)?;
             write_compact_gt(&mut w, rec.gt_compact.as_ref())?;
             write_gt_bits(&mut w, rec.gt_bits.as_ref())?;
         }
@@ -815,14 +1439,113 @@ impl VcfStore {
         w.flush()
     }
 
+    fn validate_compiled_store(&self) -> io::Result<()> {
+        let n_records = self.records.len();
+        self.hot.validate(n_records)?;
+        if self.sample_names.len() != self.n_sample.max(0) as usize {
+            return Err(invalid_data("sample count mismatch"));
+        }
+        for (idx, name) in self.sample_names.iter().enumerate() {
+            if self.sample_idx.get(name).copied() != Some(idx as i32) {
+                return Err(invalid_data("sample index mismatch"));
+            }
+        }
+
+        for (record_idx, rec) in self.records.iter().enumerate() {
+            if rec.pos != self.hot.pos[record_idx]
+                || rec.ref_end() != self.hot.ref_end[record_idx]
+                || rec.rid != self.hot.rid[record_idx]
+                || rec.var_type != self.hot.var_type[record_idx]
+                || rec.rlen.max(0) as u32 != self.hot.ref_len[record_idx]
+                || rec.alleles.len() != self.hot.n_alleles[record_idx] as usize
+                || rec.compiled.kind != self.hot.kind[record_idx]
+                || rec.compiled.flags != self.hot.flags[record_idx]
+            {
+                return Err(invalid_data("record/hot column mismatch"));
+            }
+            if !self.seq_names.values().any(|&rid| rid == rec.rid) {
+                return Err(invalid_data("record rid is not declared in header"));
+            }
+            for allele_idx in 0..rec.alleles.len() {
+                if self.hot.allele(record_idx, allele_idx) != Some(&rec.alleles[allele_idx][..]) {
+                    return Err(invalid_data("record allele pool mismatch"));
+                }
+            }
+            let op_offset = self.hot.op_offset[record_idx] as usize;
+            let op_len = self.hot.op_len[record_idx] as usize;
+            let ops = self
+                .hot
+                .ops
+                .get(op_offset..op_offset + op_len)
+                .ok_or_else(|| invalid_data("record allele op table out of range"))?;
+            if rec.compiled.ops.as_slice() != ops {
+                return Err(invalid_data("record allele op table mismatch"));
+            }
+            if let Some(compact) = rec.gt_compact.as_ref() {
+                if compact.n_samples() != self.n_sample.max(0) as usize {
+                    return Err(invalid_data("compact GT sample count mismatch"));
+                }
+            } else if !rec.gt.is_empty() && rec.gt.len() != self.n_sample.max(0) as usize {
+                return Err(invalid_data("raw GT sample count mismatch"));
+            }
+            if let Some(bits) = rec.gt_bits.as_ref() {
+                if bits.n_samples != self.n_sample.max(0) as usize {
+                    return Err(invalid_data("GT bitset sample count mismatch"));
+                }
+            }
+        }
+
+        let mut seen = vec![false; n_records];
+        for (&rid, idx) in &self.by_rid {
+            if !self.seq_names.values().any(|&declared| declared == rid) {
+                return Err(invalid_data("coord index rid is not declared in header"));
+            }
+            let pmax = self
+                .pmax_end
+                .get(&rid)
+                .ok_or_else(|| invalid_data("missing pmax coord index"))?;
+            if idx.len() != pmax.len() {
+                return Err(invalid_data("coord index length mismatch"));
+            }
+            let mut prev_pos = i64::MIN;
+            let mut expected_pmax = i64::MIN;
+            for (&record_idx, &pmax_value) in idx.iter().zip(pmax) {
+                let record_idx = record_idx as usize;
+                let rec = self
+                    .records
+                    .get(record_idx)
+                    .ok_or_else(|| invalid_data("coord index record out of range"))?;
+                if rec.rid != rid || self.hot.rid[record_idx] != rid {
+                    return Err(invalid_data("coord index rid mismatch"));
+                }
+                if rec.pos < prev_pos {
+                    return Err(invalid_data("coord index position ordering mismatch"));
+                }
+                expected_pmax = expected_pmax.max(rec.ref_end());
+                if pmax_value != expected_pmax {
+                    return Err(invalid_data("coord index pmax mismatch"));
+                }
+                if seen[record_idx] {
+                    return Err(invalid_data("duplicate record in coord index"));
+                }
+                seen[record_idx] = true;
+                prev_pos = rec.pos;
+            }
+        }
+        if seen.iter().any(|&v| !v) {
+            return Err(invalid_data("record missing from coord index"));
+        }
+        Ok(())
+    }
+
     fn rebuild_pmax_end(&mut self) {
         self.pmax_end.clear();
         for (rid, idx) in self.by_rid.iter_mut() {
-            idx.sort_by_key(|&i| self.records[i as usize].pos);
+            idx.sort_by_key(|&i| self.hot.pos[i as usize]);
             let mut pmax: Vec<i64> = Vec::with_capacity(idx.len());
             let mut m: i64 = i64::MIN;
             for &i in idx.iter() {
-                let re = self.records[i as usize].ref_end();
+                let re = self.hot.ref_end[i as usize];
                 if re > m {
                     m = re;
                 }
@@ -912,6 +1635,42 @@ impl VcfStore {
                 let pos = ffi::shim_bcf_pos(rec);
                 let rlen = ffi::shim_bcf_rlen(rec) as i32;
                 let rid = ffi::shim_bcf_rid(rec);
+                let seqname_ptr = ffi::shim_bcf_seqname(hdr, rec);
+                let seqname = if seqname_ptr.is_null() {
+                    None
+                } else {
+                    Some(cstr_to_string(seqname_ptr))
+                };
+
+                // htslib auto-registers an undeclared contig (via fix_chromosome)
+                // on bcf_read, so `rid` is valid and `seqname` resolves even when
+                // the header has no ##contig line. We mirror bcftools/htslib: warn
+                // once per contig and register it into `seq_names` so downstream
+                // queries work without forcing the user to preprocess the VCF.
+                // A negative rid means htslib itself failed to register the contig
+                // (BCF_ERR_CTG_INVALID) — that stays a hard error.
+                if rid < 0 {
+                    let chrom = seqname.as_deref().unwrap_or("<unknown>");
+                    return Err(format!(
+                        "VCF record contig '{}' at {}:{} could not be registered by htslib (invalid contig) in {}",
+                        chrom, chrom, pos + 1, self.path.display()
+                    ));
+                }
+                let already_declared = seqname
+                    .as_deref()
+                    .map(|name| self.seq_names.get(name).copied() == Some(rid))
+                    .unwrap_or(false);
+                if !already_declared {
+                    if let Some(name) = seqname.as_deref() {
+                        if !self.undeclared_contig_warned.insert(name.to_string()) {
+                            eprintln!(
+                                "[pyconsensus] warning: contig '{}' is not declared in the VCF header of {}; auto-registering (bcftools/htslib behaves the same). A matching ##contig=<ID={}> line is recommended for best performance.",
+                                name, self.path.display(), name
+                            );
+                        }
+                        self.seq_names.insert(name.to_string(), rid);
+                    }
+                }
                 let n_allele = ffi::shim_bcf_n_allele(rec);
 
                 let mut alleles: Vec<SmallVec<[u8; 16]>> = Vec::with_capacity(n_allele as usize);
@@ -955,7 +1714,7 @@ impl VcfStore {
 
                 let rid_bucket = self.by_rid.entry(rid).or_default();
                 rid_bucket.push(self.records.len() as u32);
-                self.records.push(VcfRecord {
+                let record = VcfRecord {
                     pos,
                     rlen,
                     rid,
@@ -965,7 +1724,9 @@ impl VcfStore {
                     gt_bits: decoded_gt.gt_bits,
                     var_type,
                     compiled,
-                });
+                };
+                self.hot.push_record(&record);
+                self.records.push(record);
             }
 
             if !gt_buf.is_null() {
@@ -978,6 +1739,7 @@ impl VcfStore {
 
         // Sort each rid bucket by pos (stable on file order) and build pmax_end.
         self.rebuild_pmax_end();
+        self.validate_compiled_store().map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -1308,44 +2070,23 @@ fn write_bytes<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
-fn read_compiled_record<R: Read>(r: &mut R) -> io::Result<CompiledRecord> {
-    let kind = read_record_kind(r)?;
-    let flags = RecordFlags::from_bits(read_u16(r)?);
-    let n_ops = read_len(r)?;
-    if n_ops > (1usize << 20) {
-        return Err(invalid_data("compiled op table too large"));
+fn read_bytes64<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    let len = read_len64(r)?;
+    if len > (1usize << 36) {
+        return Err(invalid_data("byte field too large"));
     }
-    let mut ops: SmallVec<[AlleleOp; 2]> = SmallVec::with_capacity(n_ops);
-    for _ in 0..n_ops {
-        ops.push(AlleleOp {
-            kind: read_allele_op_kind(r)?,
-            ref_len: read_u32(r)?,
-            alt_len: read_u32(r)?,
-            trim_beg: read_u16(r)?,
-            len_diff: read_i32(r)?,
-            case_flags: read_u8(r)?,
-        });
-    }
-    Ok(CompiledRecord { kind, flags, ops })
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
-fn write_compiled_record<W: Write>(w: &mut W, compiled: &CompiledRecord) -> io::Result<()> {
-    write_u8(w, compiled.kind as u8)?;
-    write_u16(w, compiled.flags.bits())?;
-    write_len(w, compiled.ops.len())?;
-    for op in &compiled.ops {
-        write_u8(w, op.kind as u8)?;
-        write_u32(w, op.ref_len)?;
-        write_u32(w, op.alt_len)?;
-        write_u16(w, op.trim_beg)?;
-        write_i32(w, op.len_diff)?;
-        write_u8(w, op.case_flags)?;
-    }
-    Ok(())
+fn write_bytes64<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    write_len64(w, bytes.len())?;
+    w.write_all(bytes)
 }
 
-fn read_record_kind<R: Read>(r: &mut R) -> io::Result<RecordKind> {
-    match read_u8(r)? {
+fn record_kind_from_u8(v: u8) -> io::Result<RecordKind> {
+    match v {
         0 => Ok(RecordKind::RefOnly),
         1 => Ok(RecordKind::Snp1),
         2 => Ok(RecordKind::SameLen),
@@ -1360,7 +2101,11 @@ fn read_record_kind<R: Read>(r: &mut R) -> io::Result<RecordKind> {
 }
 
 fn read_allele_op_kind<R: Read>(r: &mut R) -> io::Result<AlleleOpKind> {
-    match read_u8(r)? {
+    allele_op_kind_from_u8(read_u8(r)?)
+}
+
+fn allele_op_kind_from_u8(v: u8) -> io::Result<AlleleOpKind> {
+    match v {
         0 => Ok(AlleleOpKind::Ref),
         1 => Ok(AlleleOpKind::SameLen),
         2 => Ok(AlleleOpKind::Insert),
@@ -1372,6 +2117,26 @@ fn read_allele_op_kind<R: Read>(r: &mut R) -> io::Result<AlleleOpKind> {
         8 => Ok(AlleleOpKind::Unsupported),
         _ => Err(invalid_data("invalid allele op kind")),
     }
+}
+
+fn read_allele_op<R: Read>(r: &mut R) -> io::Result<AlleleOp> {
+    Ok(AlleleOp {
+        kind: read_allele_op_kind(r)?,
+        ref_len: read_u32(r)?,
+        alt_len: read_u32(r)?,
+        trim_beg: read_u16(r)?,
+        len_diff: read_i32(r)?,
+        case_flags: read_u8(r)?,
+    })
+}
+
+fn write_allele_op<W: Write>(w: &mut W, op: &AlleleOp) -> io::Result<()> {
+    write_u8(w, op.kind as u8)?;
+    write_u32(w, op.ref_len)?;
+    write_u32(w, op.alt_len)?;
+    write_u16(w, op.trim_beg)?;
+    write_i32(w, op.len_diff)?;
+    write_u8(w, op.case_flags)
 }
 
 fn read_compact_gt<R: Read>(r: &mut R) -> io::Result<Option<CompactGt>> {
@@ -1458,17 +2223,21 @@ fn read_coord_index<R: Read>(r: &mut R, store: &mut VcfStore) -> io::Result<()> 
         let mut prev_pos = i64::MIN;
         let mut prev_pmax = i64::MIN;
         for (&record_idx, &pmax_value) in idx.iter().zip(&pmax) {
-            let rec = store
-                .records
-                .get(record_idx as usize)
+            let record_idx = record_idx as usize;
+            let rec_rid = *store
+                .hot
+                .rid
+                .get(record_idx)
                 .ok_or_else(|| invalid_data("coord index record out of range"))?;
-            if rec.rid != rid {
+            if rec_rid != rid {
                 return Err(invalid_data("coord index rid mismatch"));
             }
-            if rec.pos < prev_pos || pmax_value < prev_pmax || pmax_value < rec.ref_end() {
+            let rec_pos = store.hot.pos[record_idx];
+            let rec_ref_end = store.hot.ref_end[record_idx];
+            if rec_pos < prev_pos || pmax_value < prev_pmax || pmax_value < rec_ref_end {
                 return Err(invalid_data("invalid coord index ordering"));
             }
-            prev_pos = rec.pos;
+            prev_pos = rec_pos;
             prev_pmax = pmax_value;
         }
         store.by_rid.insert(rid, idx);
@@ -1487,6 +2256,146 @@ fn write_coord_index<W: Write>(w: &mut W, store: &VcfStore) -> io::Result<()> {
             .get(&rid)
             .ok_or_else(|| invalid_data("missing pmax coord index"))?;
         write_i64_slice(w, pmax)?;
+    }
+    Ok(())
+}
+
+fn read_hot_columns<R: Read>(r: &mut R, n_records: usize) -> io::Result<RecordHotColumns> {
+    let hot = RecordHotColumns {
+        pos: read_i64_vec(r)?,
+        ref_end: read_i64_vec(r)?,
+        rid: read_i32_vec(r)?,
+        var_type: read_i32_vec(r)?,
+        kind: read_record_kind_vec(r, n_records)?,
+        flags: read_record_flags_vec(r, n_records)?,
+        ref_len: read_u32_vec(r)?,
+        n_alleles: read_u16_vec(r)?,
+        record_allele_offset: read_u32_vec(r)?,
+        allele_offsets: read_u32_vec(r)?,
+        allele_lens: read_u32_vec(r)?,
+        allele_bytes: read_bytes64(r)?,
+        op_offset: read_u32_vec(r)?,
+        op_len: read_u16_vec(r)?,
+        ops: read_allele_op_vec(r)?,
+    };
+    hot.validate(n_records)?;
+    Ok(hot)
+}
+
+fn write_hot_columns<W: Write>(
+    w: &mut W,
+    hot: &RecordHotColumns,
+    n_records: usize,
+) -> io::Result<()> {
+    hot.validate(n_records)?;
+    write_i64_slice(w, &hot.pos)?;
+    write_i64_slice(w, &hot.ref_end)?;
+    write_i32_slice(w, &hot.rid)?;
+    write_i32_slice(w, &hot.var_type)?;
+    write_record_kind_slice(w, &hot.kind)?;
+    write_record_flags_slice(w, &hot.flags)?;
+    write_u32_slice(w, &hot.ref_len)?;
+    write_u16_slice(w, &hot.n_alleles)?;
+    write_u32_slice(w, &hot.record_allele_offset)?;
+    write_u32_slice(w, &hot.allele_offsets)?;
+    write_u32_slice(w, &hot.allele_lens)?;
+    write_bytes64(w, &hot.allele_bytes)?;
+    write_u32_slice(w, &hot.op_offset)?;
+    write_u16_slice(w, &hot.op_len)?;
+    write_allele_op_slice(w, &hot.ops)
+}
+
+fn ensure_column_len(_name: &'static str, len: usize, expected: usize) -> io::Result<()> {
+    if len == expected {
+        Ok(())
+    } else {
+        Err(invalid_data("hot column length mismatch"))
+    }
+}
+
+fn read_record_kind_vec<R: Read>(r: &mut R, expected_len: usize) -> io::Result<Vec<RecordKind>> {
+    let len = read_len(r)?;
+    if len != expected_len {
+        return Err(invalid_data("record kind column length mismatch"));
+    }
+    let mut bytes = vec![0u8; len];
+    r.read_exact(&mut bytes)?;
+    bytes.into_iter().map(record_kind_from_u8).collect()
+}
+
+fn write_record_kind_slice<W: Write>(w: &mut W, kinds: &[RecordKind]) -> io::Result<()> {
+    write_len(w, kinds.len())?;
+    let bytes: Vec<u8> = kinds.iter().map(|&kind| kind as u8).collect();
+    w.write_all(&bytes)
+}
+
+fn read_record_flags_vec<R: Read>(r: &mut R, expected_len: usize) -> io::Result<Vec<RecordFlags>> {
+    let bits = read_u16_vec(r)?;
+    if bits.len() != expected_len {
+        return Err(invalid_data("record flags column length mismatch"));
+    }
+    Ok(bits.into_iter().map(RecordFlags::from_bits).collect())
+}
+
+fn write_record_flags_slice<W: Write>(w: &mut W, flags: &[RecordFlags]) -> io::Result<()> {
+    let bits: Vec<u16> = flags.iter().map(|&flags| flags.bits()).collect();
+    write_u16_slice(w, &bits)
+}
+
+fn read_allele_op_vec<R: Read>(r: &mut R) -> io::Result<Vec<AlleleOp>> {
+    let len = read_len(r)?;
+    if len > (1usize << 30) {
+        return Err(invalid_data("allele op vector too large"));
+    }
+    let mut ops = Vec::with_capacity(len);
+    for _ in 0..len {
+        ops.push(read_allele_op(r)?);
+    }
+    Ok(ops)
+}
+
+fn write_allele_op_slice<W: Write>(w: &mut W, ops: &[AlleleOp]) -> io::Result<()> {
+    write_len(w, ops.len())?;
+    for op in ops {
+        write_allele_op(w, op)?;
+    }
+    Ok(())
+}
+
+fn read_raw_gt<R: Read>(r: &mut R) -> io::Result<Vec<SmallVec<[GtAllele; 2]>>> {
+    let n_gt_samples = read_len(r)?;
+    let mut gt: Vec<SmallVec<[GtAllele; 2]>> = Vec::with_capacity(n_gt_samples);
+    for _ in 0..n_gt_samples {
+        let n_gt = read_len(r)?;
+        let mut sample_gt: SmallVec<[GtAllele; 2]> = SmallVec::new();
+        for _ in 0..n_gt {
+            let has_allele = read_bool(r)?;
+            let allele = if has_allele { Some(read_i32(r)?) } else { None };
+            let phased = read_bool(r)?;
+            let raw = read_i32(r)?;
+            sample_gt.push(GtAllele {
+                allele,
+                phased,
+                raw,
+            });
+        }
+        gt.push(sample_gt);
+    }
+    Ok(gt)
+}
+
+fn write_raw_gt<W: Write>(w: &mut W, gt: &[SmallVec<[GtAllele; 2]>]) -> io::Result<()> {
+    write_len(w, gt.len())?;
+    for sample_gt in gt {
+        write_len(w, sample_gt.len())?;
+        for gt in sample_gt {
+            write_bool(w, gt.allele.is_some())?;
+            if let Some(allele) = gt.allele {
+                write_i32(w, allele)?;
+            }
+            write_bool(w, gt.phased)?;
+            write_i32(w, gt.raw)?;
+        }
     }
     Ok(())
 }
@@ -1581,6 +2490,52 @@ fn write_u32_slice<W: Write>(w: &mut W, xs: &[u32]) -> io::Result<()> {
     {
         for &x in xs {
             write_u32(w, x)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_i32_vec<R: Read>(r: &mut R) -> io::Result<Vec<i32>> {
+    let len = read_len(r)?;
+    if len > (1usize << 30) {
+        return Err(invalid_data("i32 vector too large"));
+    }
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = len
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid_data("i32 vector byte length overflow"))?;
+        let mut out = vec![0i32; len];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), byte_len) };
+        r.read_exact(bytes)?;
+        Ok(out)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(read_i32(r)?);
+        }
+        Ok(out)
+    }
+}
+
+fn write_i32_slice<W: Write>(w: &mut W, xs: &[i32]) -> io::Result<()> {
+    write_len(w, xs.len())?;
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = xs
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid_data("i32 slice byte length overflow"))?;
+        let bytes = unsafe { std::slice::from_raw_parts(xs.as_ptr().cast::<u8>(), byte_len) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &x in xs {
+            write_i32(w, x)?;
         }
         Ok(())
     }
@@ -1760,14 +2715,21 @@ mod tests {
     /// `name` makes the temp dir unique per test so parallel `cargo test`
     /// doesn't race on a shared directory.
     fn write_vcf(name: &str, body: &str) -> std::path::PathBuf {
+        write_vcf_with_header(
+            name,
+            "##fileformat=VCFv4.3\n\
+            ##contig=<ID=chr1,length=1000>\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+            body,
+        )
+    }
+
+    fn write_vcf_with_header(name: &str, header: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("consensus_rs_vcf_{}", name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let vcf = dir.join("test.vcf");
-        let header = "##fileformat=VCFv4.3\n\
-            ##contig=<ID=chr1,length=1000>\n\
-            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
-            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n";
         std::fs::write(&vcf, format!("{}{}", header, body)).unwrap();
         vcf
     }
@@ -1788,6 +2750,19 @@ mod tests {
         assert_eq!(store.n_records(), 3);
         assert!(store.has_gt());
         assert_eq!(store.compile_stats().compact_gt_records, 3);
+        assert_eq!(store.hot.len(), store.records().len());
+        assert_eq!(store.hot.pos, vec![9, 19, 29]);
+        assert_eq!(store.hot.ref_end, vec![9, 20, 29]);
+        assert_eq!(store.hot.rid, vec![0, 0, 0]);
+        assert_eq!(store.hot.kind[0], RecordKind::Snp1);
+        assert!(store.hot.flags[0].contains(RecordFlags::BIALLELIC));
+        assert_eq!(store.compiled_n_alleles(0), Some(2));
+        assert_eq!(store.compiled_allele(0, 0), Some(&b"G"[..]));
+        assert_eq!(store.compiled_allele(0, 1), Some(&b"A"[..]));
+        assert_eq!(
+            store.compiled_allele_op(0, 1).map(|op| op.kind),
+            Some(AlleleOpKind::SameLen)
+        );
 
         let r0 = &store.records()[0];
         assert_eq!(r0.pos, 9); // 1-based 10 -> 0-based 9
@@ -1819,6 +2794,58 @@ mod tests {
     }
 
     #[test]
+    fn missing_contig_header_warns_and_autoregisters() {
+        // No ##contig line in the header: htslib auto-registers the contig on
+        // bcf_read (fix_chromosome), and we mirror that — warn once and register
+        // so queries work without forcing the user to preprocess the VCF.
+        let vcf = write_vcf_with_header(
+            "missing_contig_header",
+            "##fileformat=VCFv4.3\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).expect("missing ##contig should warn, not fail");
+        // contig auto-registered, queryable both with and without chr prefix
+        let rid = store.rid_of("chr1").expect("chr1 should be auto-registered");
+        assert_eq!(store.rid_of("1"), Some(rid));
+        assert_eq!(store.query("chr1", 9, 9, 0).len(), 1);
+        assert_eq!(store.query("1", 9, 9, 0).len(), 1);
+    }
+
+    #[test]
+    fn chr_alias_query_requires_declared_contig() {
+        let vcf = write_vcf_with_header(
+            "chr_alias_declared",
+            "##fileformat=VCFv4.3\n\
+             ##contig=<ID=1,length=1000>\n\
+             ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n",
+            "1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|1\n",
+        );
+        let store = VcfStore::load(&vcf).unwrap();
+        assert_eq!(store.rid_of("1"), Some(0));
+        assert_eq!(store.rid_of("chr1"), Some(0));
+        assert_eq!(store.query("chr1", 9, 9, 0).len(), 1);
+    }
+
+    #[test]
+    fn cache_write_rejects_inconsistent_compiled_store() {
+        let vcf = write_vcf(
+            "cache_rejects_inconsistent",
+            "chr1\t10\t.\tG\tA\t.\t.\t.\tGT\t0|1\t1|1\n",
+        );
+        let mut store = VcfStore::load(&vcf).unwrap();
+        store.hot.rid[0] = 12345;
+        let fp = source_fingerprint(&vcf).unwrap();
+        let bad_cache = VcfStore::default_cache_path(&vcf).with_extension("bad.cvcf");
+        let err = store
+            .write_cache_file(&bad_cache, fp)
+            .expect_err("invalid compiled store must not be cached");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn writes_and_reads_owned_cvcf_cache() {
         let vcf = write_vcf(
             "cache_roundtrip",
@@ -1843,6 +2870,31 @@ mod tests {
         assert_eq!(
             cached.compile_stats().compact_gt_records,
             parsed.compile_stats().compact_gt_records
+        );
+        assert_eq!(cached.hot.len(), cached.records().len());
+        assert_eq!(cached.hot.pos, parsed.hot.pos);
+        assert_eq!(cached.hot.ref_end, parsed.hot.ref_end);
+        assert_eq!(cached.hot.rid, parsed.hot.rid);
+        assert_eq!(cached.hot.var_type, parsed.hot.var_type);
+        assert_eq!(cached.hot.kind, parsed.hot.kind);
+        assert_eq!(cached.hot.flags, parsed.hot.flags);
+        assert_eq!(cached.hot.ref_len, parsed.hot.ref_len);
+        assert_eq!(cached.hot.n_alleles, parsed.hot.n_alleles);
+        assert_eq!(
+            cached.hot.record_allele_offset,
+            parsed.hot.record_allele_offset
+        );
+        assert_eq!(cached.hot.allele_offsets, parsed.hot.allele_offsets);
+        assert_eq!(cached.hot.allele_lens, parsed.hot.allele_lens);
+        assert_eq!(cached.hot.allele_bytes, parsed.hot.allele_bytes);
+        assert_eq!(cached.hot.op_offset, parsed.hot.op_offset);
+        assert_eq!(cached.hot.op_len, parsed.hot.op_len);
+        assert_eq!(cached.hot.ops, parsed.hot.ops);
+        assert_eq!(cached.compiled_allele(1, 0), parsed.compiled_allele(1, 0));
+        assert_eq!(cached.compiled_allele(1, 1), parsed.compiled_allele(1, 1));
+        assert_eq!(
+            cached.compiled_allele_op(1, 1),
+            parsed.compiled_allele_op(1, 1)
         );
         let q = cached.query("chr1", 0, 25, 1);
         assert_eq!(q.len(), 2);
@@ -1969,6 +3021,21 @@ mod tests {
         }
         let positions: Vec<i64> = spanning.iter().map(|r| r.pos).collect();
         assert_eq!(positions, vec![4, 7, 11]);
+        let indices: Vec<usize> = spanning.iter_indices().unwrap().collect();
+        assert_eq!(indices, vec![0, 1, 2]);
+        let spans: Vec<(i64, i64)> = spanning
+            .iter_spans()
+            .map(|span| (span.pos, span.ref_end))
+            .collect();
+        assert_eq!(spans, vec![(4, 8), (7, 7), (11, 11)]);
+        let metas: Vec<RecordKind> = spanning.iter_meta().map(|m| m.kind).collect();
+        assert_eq!(
+            metas,
+            vec![RecordKind::NormDeletion, RecordKind::Snp1, RecordKind::Snp1]
+        );
+        assert!(spanning
+            .iter_meta()
+            .all(|m| m.flags.contains(RecordFlags::BIALLELIC)));
     }
 
     #[test]

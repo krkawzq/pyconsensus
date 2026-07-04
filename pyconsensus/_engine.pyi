@@ -52,8 +52,8 @@ class _ConsensusIter(Iterator[tuple[int, ConsensusResult]]):
 
 
 class _ConsensusEngine:
-    def __init__(
-        self,
+    def __new__(
+        cls,
         ref_path: str,
         vcfs: Mapping[str, str],
         iupac_codes: bool = False,

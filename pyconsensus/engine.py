@@ -96,6 +96,37 @@ class ConsensusEngine(_ConsensusEngine):
     implements `__iter__` / `__next__` and releases the GIL while blocking.
     """
 
+    def __new__(
+        cls,
+        ref_path: str,
+        vcfs: Mapping[str, str],
+        iupac_codes: bool = False,
+        missing: str | None = None,
+        absent: str | None = None,
+        mark_del: str | None = None,
+        mark_ins: str | None = None,
+        mark_snv: str | None = None,
+        mask: str | None = None,
+        mask_with: str = "N",
+        chain: bool = False,
+        regions_overlap: int = 1,
+    ):
+        return super().__new__(
+            cls,
+            ref_path=ref_path,
+            vcfs=dict(vcfs),
+            iupac_codes=iupac_codes,
+            missing=missing,
+            absent=absent,
+            mark_del=mark_del,
+            mark_ins=mark_ins,
+            mark_snv=mark_snv,
+            mask=mask,
+            mask_with=mask_with,
+            chain=chain,
+            regions_overlap=regions_overlap,
+        )
+
     def __init__(
         self,
         ref_path: str,
@@ -111,20 +142,7 @@ class ConsensusEngine(_ConsensusEngine):
         chain: bool = False,
         regions_overlap: int = 1,
     ) -> None:
-        super().__init__(
-            ref_path=ref_path,
-            vcfs=dict(vcfs),
-            iupac_codes=iupac_codes,
-            missing=missing,
-            absent=absent,
-            mark_del=mark_del,
-            mark_ins=mark_ins,
-            mark_snv=mark_snv,
-            mask=mask,
-            mask_with=mask_with,
-            chain=chain,
-            regions_overlap=regions_overlap,
-        )
+        pass
 
     # -- convenience: cartesian product -------------------------------------
 
