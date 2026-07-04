@@ -16,11 +16,10 @@
 #   scripts/build_wheels.sh 3.11 3.13    # build once (3.11), verify both
 #
 # Environment:
-#   AUDITWHEEL_MODE   "skip" (default) | "warn" | "repair". The repair step
-#                     fails on this host because libdeflate.so.0 is not on the
-#                     manylinux allow-list and the repair pass hits ENODEV.
-#                     We link against system zlib/bz2/lzma/deflate, which are
-#                     present on every target host, so "skip" is correct.
+#   AUDITWHEEL_MODE   "repair" (default) | "warn" | "skip". The compression
+#                     libs (z/deflate/bz2/lzma/zstd) are statically linked into
+#                     the cdylib (see build.rs), so the .so's NEEDED list is
+#                     manylinux-clean and auditwheel repair needs nothing to do.
 #   WHEELS_TMPDIR     directory for throw-away verify venvs (default: /tmp).
 #
 # Prerequisites: uv, maturin, cargo. `uv python install` downloads CPython
@@ -39,13 +38,14 @@ fi
 
 DIST_DIR="$PROJECT_ROOT/dist"
 mkdir -p "$DIST_DIR"
-: "${AUDITWHEEL_MODE:=skip}"
+: "${AUDITWHEEL_MODE:=repair}"
 : "${WHEELS_TMPDIR:=/tmp}"
 mkdir -p "$WHEELS_TMPDIR"
 
-# Color-free, grep-friendly progress prefixes.
-log()  { printf '>> %s\n' "$*"; }
-ver()  { printf '   [%s] %s\n' "$1" "$2"; }
+# Color-free, grep-friendly progress prefixes. Written to stderr so they never
+# pollute values captured via "$(...)" (e.g. interpreter paths).
+log()  { printf '>> %s\n' "$*" >&2; }
+ver()  { printf '   [%s] %s\n' "$1" "$2" >&2; }
 
 ensure_interpreter() {
   local v="$1"

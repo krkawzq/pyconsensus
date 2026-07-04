@@ -57,12 +57,27 @@ fn main() {
     build_shim(&manifest_dir, &htslib_dir, &out_dir);
 
     // Link order matters for static archives: shim + libhts.a first, then the
-    // system shared libs that resolve their undefined symbols.
+    // system libs that resolve their undefined symbols.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=hts_shim");
     println!("cargo:rustc-link-search=native={}", htslib_dir.display());
     println!("cargo:rustc-link-lib=static=hts");
-    for lib in ["z", "deflate", "bz2", "lzma", "zstd", "pthread", "m", "dl"] {
+
+    // Statically link the compression libs that htslib pulls in (z, libdeflate,
+    // bz2, lzma, zstd). Doing so keeps the resulting cdylib's NEEDED list down
+    // to manylinux-allowlisted system libs (libm/libgcc_s/libc/ld-linux plus
+    // pthread/dl below), so the wheel is self-contained and auditwheel has no
+    // external library to repair. libdeflate.so.0 in particular is NOT on the
+    // manylinux allow-list and breaks `auditwheel repair` on this host.
+    //
+    // These `.a` archives ship with the system's -dev packages; verify each is
+    // present so a missing one fails loudly here instead of as a link error.
+    for lib in ["z", "deflate", "bz2", "lzma", "zstd"] {
+        ensure_static_lib(lib);
+        println!("cargo:rustc-link-lib=static={}", lib);
+    }
+    // pthread/m/dl ARE on the manylinux allow-list — keep them dynamic.
+    for lib in ["pthread", "m", "dl"] {
         println!("cargo:rustc-link-lib=dylib={}", lib);
     }
 
@@ -224,6 +239,38 @@ fn num_cpus_hint() -> Option<String> {
         .ok()
         .map(|s| s.matches("processor\t:").count())
         .map(|c| c.to_string())
+}
+
+/// Panic with a actionable message if `lib<name>.a` is not on the system.
+/// Statically linking htslib's compression deps requires the matching -dev
+/// packages; a missing archive would otherwise surface as an opaque link error.
+fn ensure_static_lib(name: &str) {
+    let archive = format!("lib{}.a", name);
+    let candidates = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/usr/lib",
+        "/lib",
+    ];
+    let found = candidates
+        .iter()
+        .any(|dir| Path::new(dir).join(&archive).exists());
+    if !found {
+        let pkg = match name {
+            "z" => "zlib1g-dev",
+            "deflate" => "libdeflate-dev",
+            "bz2" => "libbz2-dev",
+            "lzma" => "liblzma-dev",
+            "zstd" => "libzstd-dev",
+            other => other,
+        };
+        panic!(
+            "static library `{}` not found in standard search paths. Install \
+             the matching -dev package, e.g.:\n  sudo apt install {}",
+            archive, pkg
+        );
+    }
 }
 
 fn build_shim(manifest_dir: &Path, htslib_dir: &Path, out_dir: &Path) {
