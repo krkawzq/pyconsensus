@@ -1,17 +1,12 @@
 name: Release
 
-# Build a manylinux abi3 wheel and publish to PyPI via Trusted Publishing (OIDC).
-# Triggered by pushing a tag named `v*` (e.g. v0.1.0). No PyPI API token is
-# needed — the workflow identity (repo + workflow + environment) is registered
-# as a trusted publisher on the PyPI project `py-consensus`.
+# Build a manylinux abi3 wheel and publish to PyPI using an API token stored
+# in the repository secret `PYPI_API_TOKEN`. Triggered by pushing a tag named
+# `v*` (e.g. v0.1.0), or manually via workflow_dispatch.
 #
-# PyPI trusted publisher setup (one-time, manual):
-#   https://docs.pypi.org/trusted-publishers/adding-a-publisher/
-#   PyPI project: py-consensus
-#   Owner:        krkawzq
-#   Repo:         pyconsensus
-#   Workflow:     release.yml
-#   Environment:  pypi
+# The wheel is built inside a manylinux container. build.rs compiles htslib
+# and the five compression libs (zlib / bzip2 / xz / libdeflate / zstd) from
+# source with -fPIC, so the container only needs autotools + cmake + make.
 
 on:
   push:
@@ -20,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for PyPI trusted publishing (OIDC)
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,24 +32,13 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install htslib build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool make gcc \
-            zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
-
       - name: Build manylinux abi3 wheel
         uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release -o dist
-          # manylinux2014 image: broadly compatible glibc baseline, plus the
-          # autotools / zlib / bz2 / lzma / zstd -dev headers maturin-action
-          # provisions inside the container.
-          target: x86_64-unknown-linux-gnu
           before-script-linux: |
-            yum install -y autoconf automake libtool make gcc \
+            yum install -y autoconf automake libtool make gcc cmake \
               zlib-devel bzip2-devel xz-devel zstd-devel
 
       - name: Upload wheel artifact
@@ -71,17 +54,20 @@ jobs:
     runs-on: ubuntu-22.04
     environment:
       name: pypi
-      url: https://pypi.org/project/py-consensus/
+      url: https://pypi.org/project/pyconsensus-rs/
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: wheel-linux-x86_64
           path: dist
 
-      - name: Publish to PyPI (trusted publisher)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # print-hashes here doubles as a final "what got published" summary.
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          # print-hashes doubles as a final "what got published" summary.
           print-hash: true
+          # Re-running a release tag shouldn't 400 on an already-published
+          # version; skip instead so the workflow stays green.
           skip-existing: true

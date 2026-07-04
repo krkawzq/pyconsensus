@@ -6,6 +6,7 @@ A Rust rewrite of `bcftools consensus` for the enformer expression-prediction pi
 
 **Personal diploid consensus sequences — online, in-memory, byte-exact.**
 
+[![PyPI](https://img.shields.io/pypi/v/pyconsensus-rs.svg?logo=pypi&logoColor=white)](https://pypi.org/project/pyconsensus-rs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -40,15 +41,32 @@ The bottleneck is the **repeated spawning, reparsing, and disk I/O** — not the
 - **📈 Built-in profile counters** — `compile_stats()` reports VCF record/allele/GT layout counts, and `consensus_many_profile()` reports lane hit counts, fallback reasons, throughput rates, records seen, and output length totals without returning sequence bytes.
 - **📦 Bounded group size** — `max_tasks_per_group=0` keeps legacy unlimited grouping; positive values split large region groups for better load balance and a predictable in-flight task bound.
 
-## Build
+## Installation
 
 ```sh
-maturin build --release -o dist            # -> dist/pyconsensus-*.whl
-pip install dist/pyconsensus-*.whl
+pip install pyconsensus-rs
+```
+
+Pre-built wheels are published on [PyPI](https://pypi.org/project/pyconsensus-rs/)
+— no Rust toolchain needed. The wheel is `abi3-py310` and `manylinux_2_34`-compliant,
+so a single build covers CPython 3.10+ on x86-64 Linux.
+
+<details>
+<summary>Build from source</summary>
+
+```sh
+maturin build --release -o dist            # -> dist/pyconsensus_rs-*.whl
+pip install dist/pyconsensus_rs-*.whl
 ```
 
 For local development, `maturin develop --release` installs straight into the
-active venv. The wheel is `abi3-py310` (abi3), so one build covers CPython 3.10+.
+active venv. The first source build downloads htslib plus the compression-lib
+tarballs (zlib / bzip2 / xz / libdeflate / zstd) and compiles them with `-fPIC`
+so they link cleanly into the cdylib; on restricted networks run `labpon` (or
+export `http_proxy` / `https_proxy`) first. `scripts/build_wheels.sh` builds
+and verifies the wheel across CPython 3.10–3.15.
+
+</details>
 
 ## Usage
 

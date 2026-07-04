@@ -34,11 +34,11 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install htslib build deps
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool make gcc \
+            autoconf automake libtool make gcc cmake \
             zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
 
       - name: cargo test (core, no python feature)
@@ -49,7 +49,6 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --all-targets --features python -- -D warnings
-        continue-on-error: true
 
   # ── Python import smoke across 3.10–3.15 ──────────────────────────────────
   # Build the abi3 wheel once, then install it into a matrix of CPython
@@ -69,11 +68,11 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install htslib build deps
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool make gcc \
+            autoconf automake libtool make gcc cmake \
             zlib1g-dev libbz2-dev liblzma-dev libzstd-dev
 
       - name: Set up Python ${{ matrix.python }}
@@ -90,7 +89,7 @@ jobs:
           maturin build --release -o dist
 
       - name: Install wheel
-        run: pip install --no-index --find-links dist py-consensus
+        run: pip install --no-index --find-links dist pyconsensus-rs
 
       - name: Import smoke
         run: |
@@ -118,11 +117,11 @@ jobs:
         with:
           workspaces: "."
 
-      - name: Install bcftools + htslib build deps
+      - name: Install bcftools + build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake libtool make gcc \
+            autoconf automake libtool make gcc cmake \
             zlib1g-dev libbz2-dev liblzma-dev libzstd-dev \
             bcftools tabix
 

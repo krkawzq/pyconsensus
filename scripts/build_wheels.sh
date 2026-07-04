@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build_wheels.sh — build the py-consensus wheel for CPython 3.10-3.15 and
+# build_wheels.sh — build the pyconsensus-rs wheel for CPython 3.10-3.15 and
 # verify it installs and imports on every supported version.
 #
 # The PyO3 binding is compiled with the `abi3-py310` feature (see
@@ -74,10 +74,11 @@ maturin build --release \
   --auditwheel "$AUDITWHEEL_MODE" \
   -o "$DIST_DIR"
 
-# 3. Locate the freshly built wheel (only one expected).
-mapfile -t WHEELS < <(ls -1 "$DIST_DIR"/py_consensus-*.whl 2>/dev/null || true)
+# 3. Locate the freshly built wheel (only one expected). Match any name so the
+#    glob keeps working if the PyPI distribution name ever changes.
+mapfile -t WHEELS < <(ls -1 "$DIST_DIR"/*.whl 2>/dev/null || true)
 if [[ ${#WHEELS[@]} -eq 0 ]]; then
-  log "ERROR: no py_consensus-*.whl found in $DIST_DIR"
+  log "ERROR: no *.whl found in $DIST_DIR"
   exit 1
 fi
 WHEEL="${WHEELS[0]}"
@@ -109,7 +110,7 @@ done
 
 # 5. Summary.
 log "wheels in $DIST_DIR:"
-ls -la "$DIST_DIR"/py_consensus-*.whl
+ls -la "$DIST_DIR"/*.whl
 
 if [[ "$ALL_OK" -ne 1 ]]; then
   log "ERROR: one or more versions failed import verification"

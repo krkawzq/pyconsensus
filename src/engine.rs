@@ -392,7 +392,7 @@ impl ConsensusEngine {
             HashMap::new()
         } else {
             let pool = thread_pool(load_threads);
-            let loaded: Result<Vec<(Vec<String>, Arc<VcfStore>)>, String> = pool.install(|| {
+            let loaded = pool.install(|| {
                 groups
                     .into_par_iter()
                     .map(|group| {
@@ -402,7 +402,7 @@ impl ConsensusEngine {
                             Err(err) => Err(format!("VCF key '{}': {}", group.label, err)),
                         }
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, String>>()
             });
             let mut vcfs = HashMap::with_capacity(vcf_count);
             for (keys, store) in loaded? {
