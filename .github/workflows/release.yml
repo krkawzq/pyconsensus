@@ -37,8 +37,12 @@ jobs:
         with:
           command: build
           args: --release -o dist
+          # Build inside a manylinux_2_34 container so the resulting wheel is
+          # manylinux-compliant (matches local scripts/build_wheels.sh). The
+          # container is AlmaLinux 9 based, so use dnf/yum.
+          container: manylinux_2_34
           before-script-linux: |
-            yum install -y autoconf automake libtool make gcc cmake \
+            dnf install -y autoconf automake libtool make gcc cmake \
               zlib-devel bzip2-devel xz-devel zstd-devel
 
       - name: Upload wheel artifact
