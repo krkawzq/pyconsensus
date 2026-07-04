@@ -22,13 +22,50 @@ use crate::haplotype::{select_allele, AlleleSelection, SampleMode};
 use crate::htslib_ffi::VCF_REF;
 use crate::mask::Mask;
 use crate::planner::{plan_region_set, PlanOptions, RegionPlan};
-use crate::stats::{FallbackReason, FastPathLane, RuntimeStats};
+use crate::stats::{ApplyFailureKind, FallbackReason, FastPathLane, RuntimeStats};
 use crate::vcf_store::{RecordSet, VcfRecord};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 type AlleleBuf = SmallVec<[u8; 64]>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApplyErrorMode {
+    #[default]
+    Warn,
+    Error,
+}
+
+impl ApplyErrorMode {
+    #[cold]
+    pub fn from_env() -> Self {
+        static MODE: OnceLock<ApplyErrorMode> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("PYCONSENSUS_APPLY_ERROR_MODE")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "error" | "err" | "strict" | "raise" => ApplyErrorMode::Error,
+                _ => ApplyErrorMode::Warn,
+            }
+        })
+    }
+
+    #[inline(always)]
+    pub fn is_error(self) -> bool {
+        matches!(self, ApplyErrorMode::Error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplyFailure {
+    pub kind: ApplyFailureKind,
+    /// 0-based VCF position when available.
+    pub pos: Option<i64>,
+    pub message: String,
+}
 
 #[inline(always)]
 fn nonnegative3(a: i64, b: i64, c: i64) -> bool {
@@ -175,6 +212,9 @@ pub struct ApplyState {
     /// Reason recorded when a planned fastpath attempt falls back during
     /// profiled execution. Consensus bytes never depend on this field.
     pub fallback_reason: Option<FallbackReason>,
+    /// Input-data failure for this task. This marks the current output invalid
+    /// without panicking and without changing internal invariant asserts.
+    pub failed: Option<ApplyFailure>,
 }
 
 impl ApplyState {
@@ -192,12 +232,26 @@ impl ApplyState {
             buf: ref_seq,
             chr_name: String::new(),
             fallback_reason: None,
+            failed: None,
         }
     }
 
     pub fn with_chr(mut self, chr: impl Into<String>) -> Self {
         self.chr_name = chr.into();
         self
+    }
+
+    #[inline(always)]
+    pub fn is_failed(&self) -> bool {
+        self.failed.is_some()
+    }
+
+    #[cold]
+    fn fail(&mut self, kind: ApplyFailureKind, pos: Option<i64>, message: String) {
+        if self.failed.is_none() {
+            self.failed = Some(ApplyFailure { kind, pos, message });
+            self.buf.clear();
+        }
     }
 }
 
@@ -339,10 +393,15 @@ pub fn apply_region_planned_set_profile(
     for rec in records.iter() {
         let ch = chain_opt.as_deref_mut();
         apply_variant(rec, &mut state, opts, ch);
+        if state.is_failed() {
+            break;
+        }
     }
     // region-end absent fill (consensus.c:1177 apply_absent(HTS_POS_MAX))
-    if let Some(absent) = opts.absent_allele {
-        apply_absent(&mut state, i64::MAX, absent);
+    if !state.is_failed() {
+        if let Some(absent) = opts.absent_allele {
+            apply_absent(&mut state, i64::MAX, absent);
+        }
     }
     (state, FastPathLane::FallbackStateMachine)
 }
@@ -424,9 +483,14 @@ pub fn apply_region_planned_slice_profile(
     for rec in records.iter() {
         let ch = chain_opt.as_deref_mut();
         apply_variant(rec, &mut state, opts, ch);
+        if state.is_failed() {
+            break;
+        }
     }
-    if let Some(absent) = opts.absent_allele {
-        apply_absent(&mut state, i64::MAX, absent);
+    if !state.is_failed() {
+        if let Some(absent) = opts.absent_allele {
+            apply_absent(&mut state, i64::MAX, absent);
+        }
     }
     (state, FastPathLane::FallbackStateMachine)
 }
@@ -1859,12 +1923,18 @@ pub fn apply_variant(
     }
     let ialt_u = ialt as usize;
     if ialt_u >= rec.alleles.len() {
-        panic!(
-            "Broken VCF, too few alts at pos={}: ialt={} n_alleles={}",
-            rec.pos + 1,
-            ialt,
-            rec.alleles.len()
+        fail_apply(
+            state,
+            ApplyFailureKind::BrokenVcf,
+            Some(rec.pos),
+            format!(
+                "Broken VCF, too few alts at pos={}: ialt={} n_alleles={}",
+                rec.pos + 1,
+                ialt,
+                rec.alleles.len()
+            ),
         );
+        return;
     }
 
     if chain.is_none()
@@ -1926,12 +1996,18 @@ pub fn apply_variant(
         let ntrim = state.frz_pos - pos + 1;
         let nref = ref_orig.len() as i64 - ref_off;
         if ntrim >= nref {
-            panic!(
-                "failed to trim overlapping variant at pos={}, ntrim={} >= nref={}. Is the VCF normalized?",
-                pos + 1,
-                ntrim,
-                nref
+            fail_apply(
+                state,
+                ApplyFailureKind::InvalidOverlapTrim,
+                Some(pos),
+                format!(
+                    "failed to trim overlapping variant at pos={}, ntrim={} >= nref={}. Is the VCF normalized?",
+                    pos + 1,
+                    ntrim,
+                    nref
+                ),
             );
+            return;
         }
         pos += ntrim;
         rlen -= ntrim;
@@ -2016,11 +2092,17 @@ pub fn apply_variant(
         // Any other symbolic allele (<INS>, <DUP>, ...) errors. Note <INS>
         // sets trim_beg above (line 808) but is still rejected here.
         if !alt_is_symbolic_del && !is_gvcf {
-            panic!(
-                "Symbolic alleles other than <DEL>, <*> or <NON_REF> are currently not supported, e.g. \"{}\" at pos={}",
-                String::from_utf8_lossy(&alt_buf),
-                pos + 1
+            fail_apply(
+                state,
+                ApplyFailureKind::UnsupportedSymbolicAllele,
+                Some(pos),
+                format!(
+                    "Symbolic alleles other than <DEL>, <*> or <NON_REF> are currently not supported, e.g. \"{}\" at pos={}",
+                    String::from_utf8_lossy(&alt_buf),
+                    pos + 1
+                ),
             );
+            return;
         }
         if alt_is_symbolic_del {
             if opts.mark_del.is_some() {
@@ -2047,7 +2129,8 @@ pub fn apply_variant(
         // 925-965: REF mismatch with the fa buffer — prev_base fallback or error
         let fail = ref_mismatch_fallback_ok(state, pos, rlen, ref_orig, ref_off, idx);
         if !fail {
-            fail_ref_mismatch(pos, ref_orig, ref_off);
+            fail_ref_mismatch(state, pos, ref_orig, ref_off);
+            return;
         }
         alen = alt_len - alt_off;
         len_diff = alen - rlen;
@@ -2270,7 +2353,8 @@ fn apply_missing(state: &mut ApplyState, rec: &VcfRecord, mchar: u8, mark_snv: O
         if !ascii_eq_ignore_case(state.buf[idx_usize], ref_base)
             && !ref_mismatch_fallback_ok(state, pos, rlen, &[ref_base], 0, idx)
         {
-            fail_ref_mismatch(pos, &[ref_base], 0);
+            fail_ref_mismatch(state, pos, &[ref_base], 0);
+            return;
         }
         AlleleBuf::from_slice(&[ref_base])
     };
@@ -2323,13 +2407,24 @@ fn checked_alt_effective_slice(alt_buf: &[u8], alt_off: i64, alt_len: i64) -> &[
 
 #[cold]
 #[inline(never)]
-fn fail_ref_mismatch(pos: i64, ref_allele: &[u8], ref_off: i64) -> ! {
+fn fail_apply(state: &mut ApplyState, kind: ApplyFailureKind, pos: Option<i64>, message: String) {
+    state.fail(kind, pos, message);
+}
+
+#[cold]
+#[inline(never)]
+fn fail_ref_mismatch(state: &mut ApplyState, pos: i64, ref_allele: &[u8], ref_off: i64) {
     let start = ref_off.max(0) as usize;
     let ref_view = ref_allele.get(start..).unwrap_or(&[]);
-    panic!(
-        "The fasta sequence does not match the REF allele at pos={}: REF={}",
-        pos + 1,
-        String::from_utf8_lossy(ref_view)
+    fail_apply(
+        state,
+        ApplyFailureKind::RefMismatch,
+        Some(pos),
+        format!(
+            "The fasta sequence does not match the REF allele at pos={}: REF={}",
+            pos + 1,
+            String::from_utf8_lossy(ref_view)
+        ),
     );
 }
 
@@ -2392,7 +2487,8 @@ fn try_apply_same_len_allele(
     if !state.buf[idx..idx + rlen].eq_ignore_ascii_case(ref_allele)
         && !ref_mismatch_fallback_ok(state, pos, rec.rlen as i64, ref_allele, 0, idx as i64)
     {
-        fail_ref_mismatch(pos, ref_allele, 0);
+        fail_ref_mismatch(state, pos, ref_allele, 0);
+        return true;
     }
 
     let first_base = state.buf[idx];
@@ -3885,8 +3981,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "The fasta sequence does not match")]
-    fn fallback_same_len_ref_mismatch_errors_like_bcftools() {
+    fn fallback_same_len_ref_mismatch_marks_task_failed() {
         let vcf = write_vcf(
             "fallback_same_len_ref_mismatch",
             "chr1\t2\t.\tT\tG\t.\t.\t.\n",
@@ -3896,7 +3991,7 @@ mod tests {
         let fallback_plan =
             crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
 
-        let _ = apply_region_planned(
+        let state = apply_region_planned(
             "chr1",
             REF.to_vec(),
             0,
@@ -3905,11 +4000,15 @@ mod tests {
             None,
             Some(&fallback_plan),
         );
+
+        let failure = state.failed.expect("REF mismatch should fail this task");
+        assert_eq!(failure.kind, ApplyFailureKind::RefMismatch);
+        assert!(failure.message.contains("does not match the REF allele"));
+        assert!(state.buf.is_empty());
     }
 
     #[test]
-    #[should_panic(expected = "The fasta sequence does not match")]
-    fn fallback_missing_ref_mismatch_errors_like_bcftools() {
+    fn fallback_missing_ref_mismatch_marks_task_failed() {
         let vcf = write_vcf_gt(
             "fallback_missing_ref_mismatch",
             "chr1\t2\t.\tT\tG\t.\t.\t.\tGT\t./.\n",
@@ -3927,7 +4026,7 @@ mod tests {
         let fallback_plan =
             crate::planner::RegionPlan::needs_fallback(FallbackReason::UnsupportedMode, recs.len());
 
-        let _ = apply_region_planned(
+        let state = apply_region_planned(
             "chr1",
             REF.to_vec(),
             0,
@@ -3936,6 +4035,11 @@ mod tests {
             None,
             Some(&fallback_plan),
         );
+
+        let failure = state.failed.expect("REF mismatch should fail this task");
+        assert_eq!(failure.kind, ApplyFailureKind::RefMismatch);
+        assert!(failure.message.contains("does not match the REF allele"));
+        assert!(state.buf.is_empty());
     }
 
     #[test]

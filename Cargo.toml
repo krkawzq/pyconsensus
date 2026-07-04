@@ -11,6 +11,10 @@ license = "MIT"
 name = "engine"
 crate-type = ["cdylib", "rlib"]
 
+[[example]]
+name = "build_vcf_cache"
+path = "scripts/build_vcf_cache.rs"
+
 [features]
 default = []
 # Enable PyO3 Python bindings. Core modules (htslib_ffi / vcf_store / apply / ...)

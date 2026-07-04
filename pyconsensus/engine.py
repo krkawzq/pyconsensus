@@ -24,18 +24,25 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from ._engine import (
+    CacheResult,
     ConsensusResult,
     Task,
     _ConsensusEngine,
     _ConsensusIter,
     __version__,
+    get_htslib_log_level,
+    set_htslib_log_level,
 )
 
 __all__ = [
+    "CacheResult",
     "ConsensusEngine",
     "ConsensusResult",
     "Task",
+    "build_cache",
     "build_tasks",
+    "get_htslib_log_level",
+    "set_htslib_log_level",
     "__version__",
 ]
 
@@ -81,6 +88,43 @@ def build_tasks(
     return tasks
 
 
+def build_cache(
+    paths: Sequence[str],
+    *,
+    compile_threads: int | None = None,
+    force: bool = False,
+    log_level: str = "info",
+) -> list[CacheResult]:
+    """Pre-build ``.cvcf`` caches for a list of VCF files without loading
+    the reference or constructing the engine.
+
+    Thin wrapper over the Rust ``_ConsensusEngine.build_cache`` staticmethod.
+    Each path in `paths` is a VCF/BCF file (plain or bgzipped), loaded with
+    the same cache logic as the constructor: an existing valid cache is read
+    as-is (``status="hit"``); a missing or invalid cache is reparsed and
+    rewritten (``status="built"`` / ``"rebuilt"``). Paths resolving to the
+    same ``.cvcf`` (after canonicalization) are loaded only once; duplicates
+    are skipped.
+
+    * `compile_threads` — rayon pool size for loading VCFs in parallel (one
+      thread per unique VCF; a single VCF parses single-threaded). ``None``
+      uses available parallelism capped at the unique VCF count, matching the
+      constructor.
+    * `force` — ignore any existing cache and rebuild unconditionally
+      (``status="forced"``). When ``False``, an invalid cache is still rebuilt.
+
+    Returns one :class:`CacheResult` per unique input VCF, in first-seen
+    order. On any VCF failure, raises :class:`OSError` (``IOError``) naming
+    the offending path.
+    """
+    return _ConsensusEngine.build_cache(
+        list(paths),
+        compile_threads=compile_threads,
+        force=force,
+        log_level=log_level,
+    )
+
+
 class ConsensusEngine(_ConsensusEngine):
     """Public engine, subclassing the private Rust `_ConsensusEngine`.
 
@@ -109,8 +153,10 @@ class ConsensusEngine(_ConsensusEngine):
         mask: str | None = None,
         mask_with: str = "N",
         chain: bool = False,
-        regions_overlap: int = 1,
+        regions_overlap: int = 0,
         max_tasks_per_group: int = 0,
+        compile_threads: int | None = None,
+        log_level: str = "info",
     ):
         return super().__new__(
             cls,
@@ -127,6 +173,8 @@ class ConsensusEngine(_ConsensusEngine):
             chain=chain,
             regions_overlap=regions_overlap,
             max_tasks_per_group=max_tasks_per_group,
+            compile_threads=compile_threads,
+            log_level=log_level,
         )
 
     def __init__(
@@ -142,8 +190,10 @@ class ConsensusEngine(_ConsensusEngine):
         mask: str | None = None,
         mask_with: str = "N",
         chain: bool = False,
-        regions_overlap: int = 1,
+        regions_overlap: int = 0,
         max_tasks_per_group: int = 0,
+        compile_threads: int | None = None,
+        log_level: str = "info",
     ) -> None:
         pass
 

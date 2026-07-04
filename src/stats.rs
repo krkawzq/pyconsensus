@@ -77,6 +77,33 @@ impl FallbackReason {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyFailureKind {
+    RefMismatch = 0,
+    BrokenVcf = 1,
+    InvalidOverlapTrim = 2,
+    UnsupportedSymbolicAllele = 3,
+}
+
+impl ApplyFailureKind {
+    pub const COUNT: usize = 4;
+
+    #[inline]
+    pub fn as_usize(self) -> usize {
+        self as usize
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ApplyFailureKind::RefMismatch => "RefMismatch",
+            ApplyFailureKind::BrokenVcf => "BrokenVcf",
+            ApplyFailureKind::InvalidOverlapTrim => "InvalidOverlapTrim",
+            ApplyFailureKind::UnsupportedSymbolicAllele => "UnsupportedSymbolicAllele",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeStats {
     pub regions_total: u64,
@@ -87,6 +114,7 @@ pub struct RuntimeStats {
     pub same_len_fastpath_records: u64,
     pub edit_script_fastpath_records: u64,
     pub fallback_records: u64,
+    pub apply_failures: [u64; ApplyFailureKind::COUNT],
     pub alloc_bytes: u64,
 }
 
@@ -143,6 +171,14 @@ impl RuntimeStats {
         self.fallback_reasons[reason.as_usize()] += 1;
     }
 
+    pub fn observe_apply_failure(&mut self, kind: ApplyFailureKind) {
+        self.apply_failures[kind.as_usize()] += 1;
+    }
+
+    pub fn apply_failure_count(&self, kind: ApplyFailureKind) -> u64 {
+        self.apply_failures[kind.as_usize()]
+    }
+
     pub fn observe_fallback(&mut self, reason: FallbackReason) {
         self.observe_fallback_records(1);
         self.observe_fallback_reason(reason);
@@ -165,6 +201,9 @@ impl RuntimeStats {
             *dst += src;
         }
         for (dst, src) in self.fallback_reasons.iter_mut().zip(other.fallback_reasons) {
+            *dst += src;
+        }
+        for (dst, src) in self.apply_failures.iter_mut().zip(other.apply_failures) {
             *dst += src;
         }
         self.same_len_fastpath_records += other.same_len_fastpath_records;
@@ -216,6 +255,18 @@ impl RuntimeStats {
                 "fallback.{}={}",
                 reason.name(),
                 self.fallback_reason_count(reason)
+            ));
+        }
+        for kind in [
+            ApplyFailureKind::RefMismatch,
+            ApplyFailureKind::BrokenVcf,
+            ApplyFailureKind::InvalidOverlapTrim,
+            ApplyFailureKind::UnsupportedSymbolicAllele,
+        ] {
+            lines.push(format!(
+                "apply_failure.{}={}",
+                kind.name(),
+                self.apply_failure_count(kind)
             ));
         }
         lines

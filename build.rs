@@ -15,12 +15,17 @@
 //! overridden with `HTSLIB_URL`.
 //!
 //! We disable libcurl/s3/gcs/plugins: this tool only reads local files, so the
-//! remote-URL machinery and its curl dependency are unnecessary. That yields a
-//! minimal static libhts.a linked against system zlib/bz2/lzma/zstd.
+//! remote-URL machinery and its curl dependency are unnecessary.
 //!
-//! Network: the first build clones htslib from GitHub. On restricted networks
-//! (e.g. the PJLab dev box), enable a proxy first — `labpon` or export
-//! `http_proxy`/`https_proxy` — before `cargo build` / `maturin build`.
+//! htslib's compression deps (zlib, bzip2, liblzma, libdeflate, zstd) are also
+//! built from source with `-fPIC` and statically linked. The system -dev `.a`
+//! archives are non-PIC and cannot link into a cdylib; building our own keeps
+//! the wheel self-contained and manylinux-clean (no external `.so` to repair).
+//!
+//! Network: the first build clones htslib and downloads the compression-lib
+//! tarballs. On restricted networks (e.g. the PJLab dev box), enable a proxy
+//! first — `labpon` or export `http_proxy`/`https_proxy` — before `cargo
+//! build` / `maturin build`.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -56,25 +61,33 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     build_shim(&manifest_dir, &htslib_dir, &out_dir);
 
-    // Link order matters for static archives: shim + libhts.a first, then the
-    // system libs that resolve their undefined symbols.
+    // PIC static archives for htslib's compression dependencies, built from
+    // source with -fPIC (see ensure_* below). The system -dev `.a` archives are
+    // non-PIC and fail with R_X86_64_PC32 relocation errors when linked into a
+    // shared object, so we compile our own under libs/. Each ensure_* is a
+    // no-op if the archive already exists (fast incremental rebuilds).
+    let zlib_a = ensure_zlib(&libs_dir);
+    let bz2_a = ensure_bzip2(&libs_dir);
+    let lzma_a = ensure_lzma(&libs_dir);
+    let deflate_a = ensure_libdeflate(&libs_dir);
+    let zstd_a = ensure_zstd(&libs_dir);
+
+    // Link order: shim + libhts.a first, then the PIC compression archives,
+    // then the manylinux-allowlisted system libs (kept dynamic).
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=hts_shim");
     println!("cargo:rustc-link-search=native={}", htslib_dir.display());
     println!("cargo:rustc-link-lib=static=hts");
-
-    // Statically link the compression libs that htslib pulls in (z, libdeflate,
-    // bz2, lzma, zstd). Doing so keeps the resulting cdylib's NEEDED list down
-    // to manylinux-allowlisted system libs (libm/libgcc_s/libc/ld-linux plus
-    // pthread/dl below), so the wheel is self-contained and auditwheel has no
-    // external library to repair. libdeflate.so.0 in particular is NOT on the
-    // manylinux allow-list and breaks `auditwheel repair` on this host.
-    //
-    // These `.a` archives ship with the system's -dev packages; verify each is
-    // present so a missing one fails loudly here instead of as a link error.
-    for lib in ["z", "deflate", "bz2", "lzma", "zstd"] {
-        ensure_static_lib(lib);
-        println!("cargo:rustc-link-lib=static={}", lib);
+    for (archive, name) in [
+        (&zlib_a, "z"),
+        (&bz2_a, "bz2"),
+        (&lzma_a, "lzma"),
+        (&deflate_a, "deflate"),
+        (&zstd_a, "zstd"),
+    ] {
+        let dir = archive.parent().expect("archive has no parent dir");
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-lib=static={}", name);
     }
     // pthread/m/dl ARE on the manylinux allow-list — keep them dynamic.
     for lib in ["pthread", "m", "dl"] {
@@ -241,36 +254,262 @@ fn num_cpus_hint() -> Option<String> {
         .map(|c| c.to_string())
 }
 
-/// Panic with a actionable message if `lib<name>.a` is not on the system.
-/// Statically linking htslib's compression deps requires the matching -dev
-/// packages; a missing archive would otherwise surface as an opaque link error.
-fn ensure_static_lib(name: &str) {
-    let archive = format!("lib{}.a", name);
-    let candidates = [
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/usr/local/lib",
-        "/usr/lib",
-        "/lib",
-    ];
-    let found = candidates
-        .iter()
-        .any(|dir| Path::new(dir).join(&archive).exists());
-    if !found {
-        let pkg = match name {
-            "z" => "zlib1g-dev",
-            "deflate" => "libdeflate-dev",
-            "bz2" => "libbz2-dev",
-            "lzma" => "liblzma-dev",
-            "zstd" => "libzstd-dev",
-            other => other,
-        };
-        panic!(
-            "static library `{}` not found in standard search paths. Install \
-             the matching -dev package, e.g.:\n  sudo apt install {}",
-            archive, pkg
-        );
+// --- PIC static compression libs (compiled from source with -fPIC) ---------
+// The system -dev `.a` archives (zlib1g-dev, libbz2-dev, ...) are built without
+// -fPIC and cannot be linked into a cdylib: they trigger R_X86_64_PC32
+// relocation errors against symbols like `stderr`. We download release
+// tarballs and build PIC archives under libs/<name>/. Override the source URL
+// with the `<NAME>_URL` env var. A proxy (`labpon`) is required on the PJLab
+// dev box for the first build — curl inherits http_proxy/https_proxy from the
+// environment, so run `labpon` before `cargo build` / `maturin build`.
+
+const ZLIB_URL: &str = "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz";
+const BZIP2_URL: &str = "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz";
+const LZMA_URL: &str =
+    "https://github.com/tukaani-project/xz/releases/download/v5.6.2/xz-5.6.2.tar.gz";
+const LIBDEFLATE_URL: &str =
+    "https://github.com/ebiggers/libdeflate/releases/download/v1.22/libdeflate-1.22.tar.gz";
+const ZSTD_URL: &str =
+    "https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz";
+
+/// Parallelism hint for `make -j`. Prefers cargo's job count, falls back to
+/// /proc/cpuinfo, then 4.
+fn nproc() -> String {
+    env::var("CARGO_BUILD_JOBS")
+        .ok()
+        .or_else(num_cpus_hint)
+        .unwrap_or_else(|| "4".to_string())
+}
+
+/// Download `url` to `dest` with curl, verifying the tarball is intact before
+/// returning. No-op if `dest` already exists. curl honors http_proxy/
+/// https_proxy from the env. Up to 3 attempts: a truncated download (curl
+/// exits 0 on a proxy hiccup but produces a short file) is caught by the
+/// `tar -tf` integrity probe and retried after deleting the partial file.
+fn download(url: &str, dest: &Path) {
+    if dest.exists() {
+        return;
     }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            panic!("failed to create {}: {}", parent.display(), e);
+        });
+    }
+    for attempt in 1..=3 {
+        eprintln!("[build.rs] downloading {} (attempt {})", url, attempt);
+        let display = format!(
+            "curl -fL --retry 3 --max-time 300 -o {} {}",
+            dest.display(),
+            url
+        );
+        let status = Command::new("curl")
+            .args(["-fL", "--retry", "3", "--max-time", "300", "-o"])
+            .arg(dest)
+            .arg(url)
+            .status();
+        check_status(status, &display);
+        // Integrity check: list the archive; a truncated gzip/xz fails here.
+        let probe = Command::new("tar")
+            .args(["-tf", dest.to_str().expect("non-UTF-8 tarball path")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if probe.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        eprintln!("[build.rs] tarball failed integrity probe, retrying");
+        let _ = std::fs::remove_file(dest);
+    }
+    panic!(
+        "failed to download a valid tarball from {} after 3 attempts",
+        url
+    );
+}
+
+/// Extract a tarball into `dest_dir`, stripping the top-level `name-1.2.3/`
+/// component so source files land directly in dest_dir. GNU tar auto-detects
+/// gzip/bzip2/xz compression.
+fn extract_tarball(tarball: &Path, dest_dir: &Path) {
+    std::fs::create_dir_all(dest_dir).unwrap_or_else(|e| {
+        panic!("failed to create {}: {}", dest_dir.display(), e);
+    });
+    run(
+        dest_dir,
+        "tar",
+        &[
+            "-xf",
+            tarball.to_str().expect("non-UTF-8 tarball path"),
+            "--strip-components=1",
+            "--auto-compress",
+        ],
+    );
+}
+
+/// Run `program args...` in `dir` with extra environment variables.
+fn run_env(dir: &Path, program: &str, args: &[&str], envs: &[(&str, &str)]) {
+    let display = format!("{} {}", program, args.join(" "));
+    eprintln!("[build.rs] running: {} (in {})", display, dir.display());
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(dir);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let status = cmd.status();
+    check_status(status, &display);
+}
+
+/// `libz.a` built with -fPIC from zlib 1.3.1. configure writes CFLAGS into the
+/// generated Makefile, so `make` picks it up without a further override.
+fn ensure_zlib(libs_dir: &Path) -> PathBuf {
+    let dir = libs_dir.join("zlib");
+    let archive = dir.join("libz.a");
+    if archive.exists() {
+        return archive;
+    }
+    let url = env::var("ZLIB_URL").unwrap_or_else(|_| ZLIB_URL.to_string());
+    let tarball = libs_dir.join("zlib.tar.gz");
+    download(&url, &tarball);
+    extract_tarball(&tarball, &dir);
+    run_env(
+        &dir,
+        "./configure",
+        &["--static"],
+        &[("CFLAGS", "-O2 -fPIC")],
+    );
+    run(&dir, "make", &["-j", &nproc()]);
+    assert!(
+        archive.exists(),
+        "libz.a not produced at {}",
+        archive.display()
+    );
+    archive
+}
+
+/// `libbz2.a` built with -fPIC from bzip2 1.0.8. bzip2 has no configure step;
+/// CC/CFLAGS are passed as make command-line variables so they override the
+/// Makefile's own assignments.
+fn ensure_bzip2(libs_dir: &Path) -> PathBuf {
+    let dir = libs_dir.join("bzip2");
+    let archive = dir.join("libbz2.a");
+    if archive.exists() {
+        return archive;
+    }
+    let url = env::var("BZIP2_URL").unwrap_or_else(|_| BZIP2_URL.to_string());
+    let tarball = libs_dir.join("bzip2.tar.gz");
+    download(&url, &tarball);
+    extract_tarball(&tarball, &dir);
+    run(
+        &dir,
+        "make",
+        &["-j", &nproc(), "CC=gcc", "CFLAGS=-O2 -fPIC", "libbz2.a"],
+    );
+    assert!(
+        archive.exists(),
+        "libbz2.a not produced at {}",
+        archive.display()
+    );
+    archive
+}
+
+/// `liblzma.a` built with -fPIC from xz 5.6.2. The release tarball ships a
+/// pre-generated configure, so no autoreconf is needed.
+fn ensure_lzma(libs_dir: &Path) -> PathBuf {
+    let dir = libs_dir.join("xz");
+    let archive = dir.join("src/liblzma/.libs/liblzma.a");
+    if archive.exists() {
+        return archive;
+    }
+    let url = env::var("LZMA_URL").unwrap_or_else(|_| LZMA_URL.to_string());
+    let tarball = libs_dir.join("xz.tar.gz");
+    download(&url, &tarball);
+    extract_tarball(&tarball, &dir);
+    run_env(
+        &dir,
+        "./configure",
+        &[
+            "--disable-shared",
+            "--enable-static",
+            "--disable-xz",
+            "--disable-xzdec",
+            "--disable-lzmadec",
+            "--disable-lzmainfo",
+            "--disable-scripts",
+            "--disable-doc",
+        ],
+        &[("CFLAGS", "-O2 -fPIC")],
+    );
+    run(&dir, "make", &["-j", &nproc()]);
+    assert!(
+        archive.exists(),
+        "liblzma.a not produced at {}",
+        archive.display()
+    );
+    archive
+}
+
+/// `libdeflate.a` built with -fPIC from libdeflate 1.22. Since 1.22 the
+/// upstream Makefile was replaced by CMake, so we drive cmake directly: static
+/// lib only, no shared lib / gzip program / tests, with CMAKE_C_FLAGS=-fPIC.
+fn ensure_libdeflate(libs_dir: &Path) -> PathBuf {
+    let dir = libs_dir.join("libdeflate");
+    let build_dir = dir.join("build");
+    let archive = build_dir.join("libdeflate.a");
+    if archive.exists() {
+        return archive;
+    }
+    let url = env::var("LIBDEFLATE_URL").unwrap_or_else(|_| LIBDEFLATE_URL.to_string());
+    let tarball = libs_dir.join("libdeflate.tar.gz");
+    download(&url, &tarball);
+    extract_tarball(&tarball, &dir);
+    std::fs::create_dir_all(&build_dir).unwrap_or_else(|e| {
+        panic!("failed to create {}: {}", build_dir.display(), e);
+    });
+    run_env(
+        &build_dir,
+        "cmake",
+        &[
+            dir.to_str().expect("non-UTF-8 libdeflate path"),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DLIBDEFLATE_BUILD_STATIC_LIB=ON",
+            "-DLIBDEFLATE_BUILD_SHARED_LIB=OFF",
+            "-DLIBDEFLATE_BUILD_GZIP=OFF",
+            "-DLIBDEFLATE_BUILD_TESTS=OFF",
+            "-DCMAKE_C_FLAGS=-O2 -fPIC",
+        ],
+        &[],
+    );
+    run(&build_dir, "cmake", &["--build", ".", "-j", &nproc()]);
+    assert!(
+        archive.exists(),
+        "libdeflate.a not produced at {}",
+        archive.display()
+    );
+    archive
+}
+
+/// `libzstd.a` built with -fPIC from zstd 1.5.6 (built in the lib/ subdir).
+fn ensure_zstd(libs_dir: &Path) -> PathBuf {
+    let dir = libs_dir.join("zstd");
+    let archive = dir.join("lib/libzstd.a");
+    if archive.exists() {
+        return archive;
+    }
+    let url = env::var("ZSTD_URL").unwrap_or_else(|_| ZSTD_URL.to_string());
+    let tarball = libs_dir.join("zstd.tar.gz");
+    download(&url, &tarball);
+    extract_tarball(&tarball, &dir);
+    let lib_dir = dir.join("lib");
+    run(
+        &lib_dir,
+        "make",
+        &["-j", &nproc(), "CFLAGS=-O2 -fPIC", "libzstd.a"],
+    );
+    assert!(
+        archive.exists(),
+        "libzstd.a not produced at {}",
+        archive.display()
+    );
+    archive
 }
 
 fn build_shim(manifest_dir: &Path, htslib_dir: &Path, out_dir: &Path) {

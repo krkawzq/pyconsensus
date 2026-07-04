@@ -24,6 +24,10 @@ import time
 from pathlib import Path
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 DEFAULT_DATA_DIR = Path(
     "/home/wangzhongqi/Code/Project/ExpressionBenchmarkDataset/data/Geuvadis"
 )
@@ -52,6 +56,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--vcf-pattern", default=DEFAULT_VCF_PATTERN)
     parser.add_argument("--threads", type=int, default=64)
+    parser.add_argument(
+        "--compile-threads",
+        type=int,
+        default=0,
+        help="VCF cache/load threads during engine initialization; 0 means auto",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="info",
+        choices=("off", "error", "warn", "info", "debug"),
+        help="Rust engine log level",
+    )
+    parser.add_argument(
+        "--htslib-log-level",
+        default="info",
+        choices=("off", "error", "warn", "info", "debug", "trace"),
+        help="process-global htslib log level",
+    )
     parser.add_argument("--haplotypes", nargs="+", default=list(DEFAULT_HAPLOTYPES))
     parser.add_argument("--chrom", action="append", help="restrict to one chromosome; repeatable")
     parser.add_argument("--limit-genes", type=int, default=0, help="0 means no limit")
@@ -222,8 +244,13 @@ def main() -> int:
         f"{len(args.haplotypes)} haplotypes)"
     )
     print_stderr(f"threads={args.threads}")
+    print_stderr(f"compile_threads={args.compile_threads}")
+    print_stderr(f"log_level={args.log_level}")
+    print_stderr(f"htslib_log_level={args.htslib_log_level}")
 
-    from pyconsensus import ConsensusEngine
+    from pyconsensus import ConsensusEngine, set_htslib_log_level
+
+    set_htslib_log_level(args.htslib_log_level)
 
     load_started = time.perf_counter()
     engine = ConsensusEngine(
@@ -232,6 +259,8 @@ def main() -> int:
         iupac_codes=True,
         regions_overlap=args.regions_overlap,
         max_tasks_per_group=args.max_tasks_per_group,
+        compile_threads=args.compile_threads,
+        log_level=args.log_level,
     )
     load_secs = time.perf_counter() - load_started
     print_stderr(f"engine_load_sec={load_secs:.3f}")

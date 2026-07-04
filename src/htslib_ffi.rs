@@ -81,6 +81,14 @@ pub const VCF_OVERLAP: c_int = 1 << 5;
 pub const BCF_INT32_VECTOR_END: i32 = i32::MIN + 1; // -2147483647
 pub const BCF_INT32_MISSING: i32 = i32::MIN; // -2147483648
 
+/// htslib log levels (`htslib/hts_log.h`).
+pub const HTS_LOG_OFF: c_int = 0;
+pub const HTS_LOG_ERROR: c_int = 1;
+pub const HTS_LOG_WARNING: c_int = 3;
+pub const HTS_LOG_INFO: c_int = 4;
+pub const HTS_LOG_DEBUG: c_int = 5;
+pub const HTS_LOG_TRACE: c_int = 6;
+
 // ===========================================================================
 // GT decoding (replicated from htslib/vcf.h bcf_gt_* macros)
 // ===========================================================================
@@ -144,6 +152,9 @@ extern "C" {
 // ===========================================================================
 
 extern "C" {
+    pub fn hts_set_log_level(level: c_int);
+    pub fn hts_get_log_level() -> c_int;
+
     pub fn hts_open(fn_: *const c_char, mode: *const c_char) -> *mut htsFile;
     pub fn hts_close(fp: *mut htsFile) -> c_int;
 

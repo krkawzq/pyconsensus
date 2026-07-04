@@ -13,6 +13,7 @@ use crate::compiled::{
     AlleleOp, AlleleOpKind, CompiledRecord, RecordFlags, RecordKind, VcfCompileStats,
 };
 use crate::htslib_ffi as ffi;
+use crate::logging::{ensure_default_htslib_log_level, LogControl, LogLevel};
 use crate::planner::{plan_region, plan_region_set, PlanOptions, RegionPlan};
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -21,12 +22,16 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Instant, UNIX_EPOCH};
 
 const CVCF_MAGIC: &[u8; 8] = b"CVCF0001";
-const CVCF_VERSION: u32 = 13;
+const CVCF_VERSION: u32 = 14;
+const CVCF_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x100000001b3;
+static CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SourceFingerprint {
@@ -59,6 +64,10 @@ const COMPACT_GT_PHASED: u16 = 0x8000;
 /// `GtAllele` matrix is kept only when an allele index cannot fit here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactGt {
+    n_samples: usize,
+    /// 0 means variable ploidy with `sample_offsets`; non-zero means fixed-size
+    /// sample rows in `codes` and no per-record offset table.
+    ploidy: u16,
     sample_offsets: Vec<u32>,
     codes: Vec<u16>,
 }
@@ -71,7 +80,14 @@ impl CompactGt {
         let mut sample_offsets = Vec::with_capacity(n_samples + 1);
         let mut codes = Vec::new();
         sample_offsets.push(0);
+        let mut fixed_ploidy = gt
+            .first()
+            .and_then(|sample| u16::try_from(sample.len()).ok())
+            .filter(|&ploidy| ploidy != 0);
         for sample_gt in gt {
+            if fixed_ploidy != u16::try_from(sample_gt.len()).ok() {
+                fixed_ploidy = None;
+            }
             for allele in sample_gt {
                 let mut code = if let Some(idx) = allele.allele {
                     if idx < 0 || idx > COMPACT_GT_ALLELE_MASK as i32 {
@@ -90,21 +106,69 @@ impl CompactGt {
             sample_offsets.push(offset);
         }
         Some(CompactGt {
-            sample_offsets,
+            n_samples,
+            ploidy: fixed_ploidy.unwrap_or(0),
+            sample_offsets: if fixed_ploidy.is_some() {
+                Vec::new()
+            } else {
+                sample_offsets
+            },
             codes,
         })
     }
 
     #[inline]
     pub fn n_samples(&self) -> usize {
-        self.sample_offsets.len().saturating_sub(1)
+        self.n_samples
     }
 
     #[inline]
     pub fn sample(&self, sample_idx: usize) -> Option<&[u16]> {
-        let start = *self.sample_offsets.get(sample_idx)? as usize;
-        let end = *self.sample_offsets.get(sample_idx + 1)? as usize;
+        if sample_idx >= self.n_samples {
+            return None;
+        }
+        let (start, end) = if self.ploidy != 0 {
+            let start = sample_idx.checked_mul(self.ploidy as usize)?;
+            let end = start.checked_add(self.ploidy as usize)?;
+            (start, end)
+        } else {
+            let start = *self.sample_offsets.get(sample_idx)? as usize;
+            let end = *self.sample_offsets.get(sample_idx + 1)? as usize;
+            (start, end)
+        };
         self.codes.get(start..end)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.ploidy == 0 {
+            if self.sample_offsets.len() != self.n_samples + 1
+                || self.sample_offsets.first() != Some(&0)
+            {
+                return Err(invalid_data("invalid compact GT offsets"));
+            }
+            let mut prev = 0u32;
+            for &offset in &self.sample_offsets {
+                if offset < prev || offset as usize > self.codes.len() {
+                    return Err(invalid_data("invalid compact GT offset order"));
+                }
+                prev = offset;
+            }
+            if self.sample_offsets.last().copied().unwrap_or(0) as usize != self.codes.len() {
+                return Err(invalid_data("compact GT offsets do not cover codes"));
+            }
+            return Ok(());
+        }
+        if !self.sample_offsets.is_empty() {
+            return Err(invalid_data("fixed compact GT must not store offsets"));
+        }
+        let expected = self
+            .n_samples
+            .checked_mul(self.ploidy as usize)
+            .ok_or_else(|| invalid_data("compact GT code length overflow"))?;
+        if expected != self.codes.len() {
+            return Err(invalid_data("fixed compact GT code length mismatch"));
+        }
+        Ok(())
     }
 
     #[inline]
@@ -1058,14 +1122,6 @@ impl RecordHotColumns {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoadStrategy {
-    /// Preprocess the whole VCF into memory up front.
-    Eager,
-    /// Preprocess on first use of this VCF (M5 wires the lazy trigger).
-    Lazy,
-}
-
 /// In-memory store of one VCF's preprocessed records + region index.
 pub struct VcfStore {
     path: PathBuf,
@@ -1089,28 +1145,212 @@ pub struct VcfStore {
     compile_stats: VcfCompileStats,
 }
 
+/// Outcome of a cache load/build, surfaced to callers (e.g. the Python
+/// `build_cache` API) so they can report per-VCF status without re-deriving it
+/// from the store.
+pub struct CacheBuildOutcome {
+    /// `"hit"` (valid cache read) | `"built"` (no cache, parsed + written) |
+    /// `"rebuilt"` (cache existed but failed validation, reparsed + rewritten) |
+    /// `"forced"` (`force=true`, cache ignored, reparsed + rewritten).
+    pub status: &'static str,
+    pub records: usize,
+    pub samples: usize,
+    pub cache_mb: f64,
+    pub elapsed_sec: f64,
+}
+
 impl VcfStore {
     /// Eagerly load + preprocess a VCF (BCF or VCF, plain or bgzipped).
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
-        Self::load_with_strategy(path, LoadStrategy::Eager)
+        let log = LogControl::new(LogLevel::Info);
+        Self::load_with_log(path, None, &log)
     }
 
-    pub fn load_with_strategy(
+    pub fn load_with_log(
         path: impl Into<PathBuf>,
-        strat: LoadStrategy,
+        label: Option<&str>,
+        log: &LogControl,
     ) -> Result<Self, String> {
+        Self::load_with_outcome_inner(path, label, log, false, false).map(|(store, _)| store)
+    }
+
+    /// Like [`load_with_log`](Self::load_with_log) but also returns a
+    /// [`CacheBuildOutcome`] describing what happened, and supports `force`:
+    /// when true, any existing cache is ignored and the VCF is reparsed and
+    /// the cache rewritten unconditionally.
+    pub fn load_with_outcome(
+        path: impl Into<PathBuf>,
+        label: Option<&str>,
+        log: &LogControl,
+        force: bool,
+    ) -> Result<(Self, CacheBuildOutcome), String> {
+        Self::load_with_outcome_inner(path, label, log, force, true)
+    }
+
+    fn load_with_outcome_inner(
+        path: impl Into<PathBuf>,
+        label: Option<&str>,
+        log: &LogControl,
+        force: bool,
+        include_cache_mb: bool,
+    ) -> Result<(Self, CacheBuildOutcome), String> {
+        ensure_default_htslib_log_level();
         let path = path.into();
-        // LAZY is handled at the engine level (M5); here we always parse when
-        // called. The flag is accepted for API completeness.
-        let _ = strat;
-        if let Some(store) = Self::try_load_default_cache(&path) {
-            return Ok(store);
+        let total_t0 = Instant::now();
+        let source_fp = source_fingerprint(&path)
+            .map_err(|e| format!("source fingerprint failed for {}: {}", path.display(), e))?;
+        let cache_path = Self::default_cache_path(&path);
+        // Whether a cache file existed when we entered this call (before any
+        // write). Used to distinguish "built" (no prior cache) from "rebuilt"
+        // (prior cache failed validation) on the parse-and-write path.
+        let cache_existed = cache_path.exists();
+
+        if !force && cache_existed {
+            let read_t0 = Instant::now();
+            match Self::read_cache_file(path.clone(), &cache_path, source_fp) {
+                Ok(store) => {
+                    let read_sec = read_t0.elapsed().as_secs_f64();
+                    let cache_mb = cache_mb_for(log, LogLevel::Info, include_cache_mb, &cache_path);
+                    let records = store.n_records();
+                    let samples = store.sample_names().len();
+                    let elapsed_sec = total_t0.elapsed().as_secs_f64();
+                    log_cache_load(
+                        log,
+                        LogLevel::Info,
+                        label,
+                        &path,
+                        "hit",
+                        records,
+                        samples,
+                        cache_mb,
+                        read_sec,
+                        0.0,
+                        0.0,
+                        elapsed_sec,
+                    );
+                    return Ok((
+                        store,
+                        CacheBuildOutcome {
+                            status: "hit",
+                            records,
+                            samples,
+                            cache_mb,
+                            elapsed_sec,
+                        },
+                    ));
+                }
+                Err(err) => {
+                    let status = cache_error_status(&err);
+                    let cache_mb = cache_mb_for(log, LogLevel::Warn, include_cache_mb, &cache_path);
+                    log_cache_load(
+                        log,
+                        LogLevel::Warn,
+                        label,
+                        &path,
+                        status,
+                        0,
+                        0,
+                        cache_mb,
+                        read_t0.elapsed().as_secs_f64(),
+                        0.0,
+                        0.0,
+                        total_t0.elapsed().as_secs_f64(),
+                    );
+                    if log.enabled(LogLevel::Warn) {
+                        eprintln!(
+                            "pyconsensus warning: cvcf_cache_rebuild path={} cache={} reason={}",
+                            path.display(),
+                            cache_path.display(),
+                            err
+                        );
+                    }
+                }
+            }
+        } else if force {
+            log_cache_load(
+                log,
+                LogLevel::Info,
+                label,
+                &path,
+                "forced",
+                0,
+                0,
+                cache_mb_for(log, LogLevel::Info, include_cache_mb, &cache_path),
+                0.0,
+                0.0,
+                0.0,
+                total_t0.elapsed().as_secs_f64(),
+            );
+        } else {
+            log_cache_load(
+                log,
+                LogLevel::Info,
+                label,
+                &path,
+                "miss",
+                0,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                total_t0.elapsed().as_secs_f64(),
+            );
         }
 
         let mut store = VcfStore::empty(path.clone());
-        store.parse()?;
-        let _ = store.write_default_cache();
-        Ok(store)
+        let parse_t0 = Instant::now();
+        store.parse(log)?;
+        let parse_sec = parse_t0.elapsed().as_secs_f64();
+        let write_t0 = Instant::now();
+        let write_result = store.write_default_cache();
+        let write_sec = write_t0.elapsed().as_secs_f64();
+        if let Err(err) = write_result {
+            if log.enabled(LogLevel::Warn) {
+                eprintln!(
+                    "pyconsensus warning: cvcf_cache_write_failed path={} error={}",
+                    store.path.display(),
+                    err
+                );
+            }
+        }
+        let cache_mb = cache_mb_for(log, LogLevel::Info, include_cache_mb, &cache_path);
+        let records = store.n_records();
+        let samples = store.sample_names().len();
+        let elapsed_sec = total_t0.elapsed().as_secs_f64();
+        let status = if force {
+            "forced"
+        } else if cache_existed {
+            // We only reach the parse-and-write path with `!force` when a cache
+            // file existed but failed validation, so this is a rebuild.
+            "rebuilt"
+        } else {
+            "built"
+        };
+        log_cache_load(
+            log,
+            LogLevel::Info,
+            label,
+            &store.path,
+            status,
+            records,
+            samples,
+            cache_mb,
+            0.0,
+            parse_sec,
+            write_sec,
+            elapsed_sec,
+        );
+        Ok((
+            store,
+            CacheBuildOutcome {
+                status,
+                records,
+                samples,
+                cache_mb,
+                elapsed_sec,
+            },
+        ))
     }
 
     fn empty(path: PathBuf) -> Self {
@@ -1132,6 +1372,13 @@ impl VcfStore {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Path of the `.cvcf` cache file associated with this VCF
+    /// (`<vcf-path>.cvcf`). Computed from the source path; the file may not
+    /// exist yet if the cache has not been built.
+    pub fn cache_path(&self) -> PathBuf {
+        Self::default_cache_path(&self.path)
     }
 
     pub fn n_records(&self) -> usize {
@@ -1364,24 +1611,28 @@ impl VcfStore {
         PathBuf::from(p)
     }
 
-    fn tmp_cache_path(path: &Path) -> PathBuf {
-        let mut p = path.as_os_str().to_os_string();
-        p.push(".tmp");
-        PathBuf::from(p)
+    pub fn default_cache_path_for(path: &Path) -> PathBuf {
+        Self::default_cache_path(path)
     }
 
-    fn try_load_default_cache(path: &Path) -> Option<Self> {
-        let fp = source_fingerprint(path).ok()?;
-        let cache_path = Self::default_cache_path(path);
-        Self::read_cache_file(path.to_path_buf(), &cache_path, fp).ok()
+    fn tmp_cache_path(path: &Path) -> PathBuf {
+        let mut p = path.as_os_str().to_os_string();
+        let counter = CACHE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        p.push(format!(".{}.{}.tmp", std::process::id(), counter));
+        PathBuf::from(p)
     }
 
     fn write_default_cache(&self) -> io::Result<()> {
         let fp = source_fingerprint(&self.path)?;
         let cache_path = Self::default_cache_path(&self.path);
         let tmp_path = Self::tmp_cache_path(&cache_path);
-        self.write_cache_file(&tmp_path, fp)?;
-        fs::rename(tmp_path, cache_path)
+        let result = self
+            .write_cache_file_inner(&tmp_path, fp, validate_cache_before_write())
+            .and_then(|_| fs::rename(&tmp_path, &cache_path));
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        result
     }
 
     fn read_cache_file(
@@ -1394,7 +1645,8 @@ impl VcfStore {
             return Err(invalid_data("cvcf cache too small"));
         }
         let payload_len = cache_len - std::mem::size_of::<u64>() as u64;
-        let take = BufReader::new(File::open(cache_path)?).take(payload_len);
+        let take = BufReader::with_capacity(CVCF_IO_BUFFER_BYTES, File::open(cache_path)?)
+            .take(payload_len);
         let mut r = ChecksumReader::new(take);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
@@ -1434,6 +1686,7 @@ impl VcfStore {
         }
         store.has_gt = read_bool(&mut r)?;
         store.n_sample = read_i32(&mut r)?;
+        store.compile_stats = read_compile_stats(&mut r)?;
 
         let n_records = read_len64(&mut r)?;
         store.hot = read_hot_columns(&mut r, n_records)?;
@@ -1448,18 +1701,6 @@ impl VcfStore {
             let gt = read_raw_gt(&mut r)?;
             let gt_compact = read_compact_gt(&mut r)?;
             let gt_bits = read_gt_bits(&mut r)?;
-            store.compile_stats.observe_record(&compiled);
-            let n_allele = alleles.len();
-            let (has_gt, is_biallelic_phased_diploid, has_missing_gt) =
-                gt_compile_stats_from_stores(n_allele, &gt, gt_compact.as_ref());
-            store.compile_stats.observe_gt(
-                has_gt,
-                is_biallelic_phased_diploid,
-                gt_compact.is_some(),
-                gt_bits.is_some(),
-                has_missing_gt,
-            );
-            store.has_gt |= has_gt;
 
             let record = VcfRecord {
                 pos,
@@ -1485,13 +1726,30 @@ impl VcfStore {
         if footer_checksum != checksum {
             return Err(invalid_data("cvcf checksum mismatch"));
         }
-        store.validate_compiled_store()?;
+        if validate_loaded_cache() {
+            store.validate_compiled_store()?;
+        }
         Ok(store)
     }
 
+    #[cfg(test)]
     fn write_cache_file(&self, cache_path: &Path, source_fp: SourceFingerprint) -> io::Result<()> {
-        self.validate_compiled_store()?;
-        let mut w = ChecksumWriter::new(BufWriter::new(File::create(cache_path)?));
+        self.write_cache_file_inner(cache_path, source_fp, true)
+    }
+
+    fn write_cache_file_inner(
+        &self,
+        cache_path: &Path,
+        source_fp: SourceFingerprint,
+        validate: bool,
+    ) -> io::Result<()> {
+        if validate {
+            self.validate_compiled_store()?;
+        }
+        let mut w = ChecksumWriter::new(BufWriter::with_capacity(
+            CVCF_IO_BUFFER_BYTES,
+            File::create(cache_path)?,
+        ));
         w.write_all(CVCF_MAGIC)?;
         write_u32(&mut w, CVCF_VERSION)?;
         write_u64(&mut w, source_fp.path_hash)?;
@@ -1511,9 +1769,10 @@ impl VcfStore {
         }
         write_bool(&mut w, self.has_gt)?;
         write_i32(&mut w, self.n_sample)?;
+        write_compile_stats(&mut w, &self.compile_stats)?;
 
         write_len64(&mut w, self.records.len())?;
-        write_hot_columns(&mut w, &self.hot, self.records.len())?;
+        write_hot_columns(&mut w, &self.hot, self.records.len(), validate)?;
         for rec in &self.records {
             write_raw_gt(&mut w, &rec.gt)?;
             write_compact_gt(&mut w, rec.gt_compact.as_ref())?;
@@ -1641,7 +1900,7 @@ impl VcfStore {
     // preprocessing
     // -----------------------------------------------------------------------
 
-    fn parse(&mut self) -> Result<(), String> {
+    fn parse(&mut self, log: &LogControl) -> Result<(), String> {
         let cpath = CString::new(self.path.to_str().ok_or("non-UTF8 vcf path")?)
             .map_err(|_| "non-NUL vcf path".to_string())?;
         let cmode = CString::new("r").unwrap();
@@ -1656,7 +1915,7 @@ impl VcfStore {
                 ffi::hts_close(fp);
                 return Err(format!("bcf_hdr_read failed for {}", self.path.display()));
             }
-            ensure_known_missing_format_headers(hdr)?;
+            ensure_known_missing_format_headers(hdr, log)?;
 
             // Samples
             self.n_sample = ffi::shim_bcf_hdr_nsamples(hdr);
@@ -1711,13 +1970,13 @@ impl VcfStore {
                 }
                 if r < -1 {
                     malformed_records += 1;
-                    if malformed_records <= 16 {
+                    if malformed_records <= 16 && log.enabled(LogLevel::Warn) {
                         eprintln!(
                             "[W::vcf_parse] Skipping malformed VCF record in {} after bcf_read error code {}",
                             self.path.display(),
                             r
                         );
-                    } else if malformed_records == 17 {
+                    } else if malformed_records == 17 && log.enabled(LogLevel::Warn) {
                         eprintln!(
                             "[W::vcf_parse] Further malformed VCF record warnings suppressed for {}",
                             self.path.display()
@@ -1759,7 +2018,9 @@ impl VcfStore {
                     .unwrap_or(false);
                 if !already_declared {
                     if let Some(name) = seqname.as_deref() {
-                        if !self.undeclared_contig_warned.insert(name.to_string()) {
+                        if self.undeclared_contig_warned.insert(name.to_string())
+                            && log.enabled(LogLevel::Warn)
+                        {
                             eprintln!(
                                 "[pyconsensus] warning: contig '{}' is not declared in the VCF header of {}; auto-registering (bcftools/htslib behaves the same). A matching ##contig=<ID={}> line is recommended for best performance.",
                                 name, self.path.display(), name
@@ -1825,7 +2086,7 @@ impl VcfStore {
                 self.hot.push_record(&record);
                 self.records.push(record);
             }
-            if malformed_records != 0 {
+            if malformed_records != 0 && log.enabled(LogLevel::Warn) {
                 eprintln!(
                     "[W::vcf_parse] Skipped {} malformed VCF record(s) while loading {}",
                     malformed_records,
@@ -1866,6 +2127,98 @@ fn source_fingerprint(path: &Path) -> io::Result<SourceFingerprint> {
         mtime_secs: duration.as_secs() as i64,
         mtime_nanos: duration.subsec_nanos(),
     })
+}
+
+fn file_mb(path: &Path) -> Option<f64> {
+    let bytes = fs::metadata(path).ok()?.len();
+    Some(bytes as f64 / 1_000_000.0)
+}
+
+fn cache_mb_for(log: &LogControl, level: LogLevel, include_cache_mb: bool, path: &Path) -> f64 {
+    if include_cache_mb || log.enabled(level) {
+        file_mb(path).unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn cache_error_status(err: &io::Error) -> &'static str {
+    let msg = err.to_string();
+    if msg.contains("stale") || msg.contains("unsupported cvcf version") {
+        "stale"
+    } else if msg.contains("checksum") || msg.contains("bad cvcf") || msg.contains("invalid") {
+        "corrupt"
+    } else {
+        "miss"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_cache_load(
+    log: &LogControl,
+    level: LogLevel,
+    label: Option<&str>,
+    path: &Path,
+    status: &str,
+    records: usize,
+    samples: usize,
+    cache_mb: f64,
+    read_sec: f64,
+    parse_sec: f64,
+    write_sec: f64,
+    total_sec: f64,
+) {
+    if !log.enabled(level) {
+        return;
+    }
+    match label {
+        Some(label) => eprintln!(
+            "pyconsensus {}: vcf_cache key={} path={} status={} records={} samples={} cache_mb={:.1} read_sec={:.3} parse_sec={:.3} write_sec={:.3} total_sec={:.3}",
+            level.as_str(),
+            label,
+            path.display(),
+            status,
+            records,
+            samples,
+            cache_mb,
+            read_sec,
+            parse_sec,
+            write_sec,
+            total_sec
+        ),
+        None => eprintln!(
+            "pyconsensus {}: vcf_cache path={} status={} records={} samples={} cache_mb={:.1} read_sec={:.3} parse_sec={:.3} write_sec={:.3} total_sec={:.3}",
+            level.as_str(),
+            path.display(),
+            status,
+            records,
+            samples,
+            cache_mb,
+            read_sec,
+            parse_sec,
+            write_sec,
+            total_sec
+        ),
+    }
+}
+
+fn validate_loaded_cache() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("PYCONSENSUS_VALIDATE_CACHE"))
+}
+
+fn validate_cache_before_write() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("PYCONSENSUS_VALIDATE_CACHE_WRITE"))
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -1974,6 +2327,7 @@ fn decode_gt_stores(
     let mut compact_codes = Vec::with_capacity(ngt as usize);
     compact_offsets.push(0);
     let mut compact_ok = true;
+    let mut compact_fixed_ploidy = u16::try_from(ploidy).ok().filter(|&ploidy| ploidy != 0);
     let mut has_missing_gt = false;
     let mut is_biallelic_phased_diploid = n_allele == 2;
     let mut gt_bits = (n_allele == 2).then(|| BiallelicPhasedGtBits {
@@ -2020,6 +2374,9 @@ fn decode_gt_stores(
                 compact_ok = false;
                 compact_offsets.clear();
                 compact_codes.clear();
+            }
+            if sample_len != ploidy {
+                compact_fixed_ploidy = None;
             }
         }
 
@@ -2081,8 +2438,14 @@ fn decode_gt_stores(
         }
     }
 
-    let gt_compact = compact_ok.then_some(CompactGt {
-        sample_offsets: compact_offsets,
+    let gt_compact = compact_ok.then(|| CompactGt {
+        n_samples,
+        ploidy: compact_fixed_ploidy.unwrap_or(0),
+        sample_offsets: if compact_fixed_ploidy.is_some() {
+            Vec::new()
+        } else {
+            compact_offsets
+        },
         codes: compact_codes,
     });
     let gt = if gt_compact.is_some() {
@@ -2146,67 +2509,6 @@ fn decode_raw_gt_matrix(
         gt.push(sample_gt);
     }
     gt
-}
-
-fn gt_compile_stats_from_stores(
-    n_allele: usize,
-    gt: &[SmallVec<[GtAllele; 2]>],
-    compact: Option<&CompactGt>,
-) -> (bool, bool, bool) {
-    if !gt.is_empty() {
-        return gt_compile_stats(n_allele, gt);
-    }
-    let Some(compact) = compact else {
-        return (false, false, false);
-    };
-    let mut has_missing = false;
-    let mut is_biallelic_phased_diploid = n_allele == 2;
-    for sample_idx in 0..compact.n_samples() {
-        let Some(sample_gt) = compact.sample(sample_idx) else {
-            is_biallelic_phased_diploid = false;
-            continue;
-        };
-        if sample_gt.len() != 2 {
-            is_biallelic_phased_diploid = false;
-        }
-        for &code in sample_gt {
-            match CompactGt::allele(code) {
-                Some(allele) => {
-                    if !CompactGt::phased(code) || (n_allele == 2 && !(0..=1).contains(&allele)) {
-                        is_biallelic_phased_diploid = false;
-                    }
-                }
-                None => {
-                    has_missing = true;
-                    is_biallelic_phased_diploid = false;
-                }
-            }
-        }
-    }
-    (true, is_biallelic_phased_diploid, has_missing)
-}
-
-fn gt_compile_stats(n_allele: usize, gt: &[SmallVec<[GtAllele; 2]>]) -> (bool, bool, bool) {
-    if gt.is_empty() {
-        return (false, false, false);
-    }
-    let mut has_missing = false;
-    let mut is_biallelic_phased_diploid = n_allele == 2;
-    for sample_gt in gt {
-        if sample_gt.len() != 2 {
-            is_biallelic_phased_diploid = false;
-        }
-        for allele in sample_gt {
-            if allele.allele.is_none() {
-                has_missing = true;
-                is_biallelic_phased_diploid = false;
-            }
-            if !allele.phased {
-                is_biallelic_phased_diploid = false;
-            }
-        }
-    }
-    (true, is_biallelic_phased_diploid, has_missing)
 }
 
 fn invalid_data(msg: &'static str) -> io::Error {
@@ -2346,25 +2648,22 @@ fn read_compact_gt<R: Read>(r: &mut R) -> io::Result<Option<CompactGt>> {
     if !read_bool(r)? {
         return Ok(None);
     }
-    let sample_offsets = read_u32_vec(r)?;
+    let n_samples = read_len(r)?;
+    let ploidy = read_u16(r)?;
+    let sample_offsets = if ploidy == 0 {
+        read_u32_vec(r)?
+    } else {
+        Vec::new()
+    };
     let codes = read_u16_vec(r)?;
-    if sample_offsets.is_empty() || sample_offsets[0] != 0 {
-        return Err(invalid_data("invalid compact GT offsets"));
-    }
-    let mut prev = 0u32;
-    for &offset in &sample_offsets {
-        if offset < prev || offset as usize > codes.len() {
-            return Err(invalid_data("invalid compact GT offset order"));
-        }
-        prev = offset;
-    }
-    if sample_offsets.last().copied().unwrap_or(0) as usize != codes.len() {
-        return Err(invalid_data("compact GT offsets do not cover codes"));
-    }
-    Ok(Some(CompactGt {
+    let compact = CompactGt {
+        n_samples,
+        ploidy,
         sample_offsets,
         codes,
-    }))
+    };
+    compact.validate()?;
+    Ok(Some(compact))
 }
 
 fn write_compact_gt<W: Write>(w: &mut W, compact: Option<&CompactGt>) -> io::Result<()> {
@@ -2372,7 +2671,11 @@ fn write_compact_gt<W: Write>(w: &mut W, compact: Option<&CompactGt>) -> io::Res
         return write_bool(w, false);
     };
     write_bool(w, true)?;
-    write_u32_slice(w, &compact.sample_offsets)?;
+    write_len(w, compact.n_samples)?;
+    write_u16(w, compact.ploidy)?;
+    if compact.ploidy == 0 {
+        write_u32_slice(w, &compact.sample_offsets)?;
+    }
     write_u16_slice(w, &compact.codes)
 }
 
@@ -2471,6 +2774,44 @@ fn write_coord_index<W: Write>(w: &mut W, store: &VcfStore) -> io::Result<()> {
     Ok(())
 }
 
+fn read_compile_stats<R: Read>(r: &mut R) -> io::Result<VcfCompileStats> {
+    let mut stats = VcfCompileStats {
+        records_total: read_u64(r)?,
+        ..Default::default()
+    };
+    for v in &mut stats.kind_counts {
+        *v = read_u64(r)?;
+    }
+    for v in &mut stats.allele_op_counts {
+        *v = read_u64(r)?;
+    }
+    stats.biallelic_records = read_u64(r)?;
+    stats.multi_allelic_records = read_u64(r)?;
+    stats.gt_records = read_u64(r)?;
+    stats.biallelic_phased_diploid_records = read_u64(r)?;
+    stats.compact_gt_records = read_u64(r)?;
+    stats.biallelic_gt_bitset_records = read_u64(r)?;
+    stats.missing_gt_records = read_u64(r)?;
+    Ok(stats)
+}
+
+fn write_compile_stats<W: Write>(w: &mut W, stats: &VcfCompileStats) -> io::Result<()> {
+    write_u64(w, stats.records_total)?;
+    for &v in &stats.kind_counts {
+        write_u64(w, v)?;
+    }
+    for &v in &stats.allele_op_counts {
+        write_u64(w, v)?;
+    }
+    write_u64(w, stats.biallelic_records)?;
+    write_u64(w, stats.multi_allelic_records)?;
+    write_u64(w, stats.gt_records)?;
+    write_u64(w, stats.biallelic_phased_diploid_records)?;
+    write_u64(w, stats.compact_gt_records)?;
+    write_u64(w, stats.biallelic_gt_bitset_records)?;
+    write_u64(w, stats.missing_gt_records)
+}
+
 fn read_hot_columns<R: Read>(r: &mut R, n_records: usize) -> io::Result<RecordHotColumns> {
     let hot = RecordHotColumns {
         pos: read_i64_vec(r)?,
@@ -2497,8 +2838,11 @@ fn write_hot_columns<W: Write>(
     w: &mut W,
     hot: &RecordHotColumns,
     n_records: usize,
+    validate: bool,
 ) -> io::Result<()> {
-    hot.validate(n_records)?;
+    if validate {
+        hot.validate(n_records)?;
+    }
     write_i64_slice(w, &hot.pos)?;
     write_i64_slice(w, &hot.ref_end)?;
     write_i32_slice(w, &hot.rid)?;
@@ -2918,7 +3262,10 @@ unsafe fn cstr_to_bytes(p: *const std::os::raw::c_char) -> SmallVec<[u8; 16]> {
     SmallVec::from_slice(s.to_bytes())
 }
 
-unsafe fn ensure_known_missing_format_headers(hdr: *mut ffi::bcf_hdr_t) -> Result<(), String> {
+unsafe fn ensure_known_missing_format_headers(
+    hdr: *mut ffi::bcf_hdr_t,
+    log: &LogControl,
+) -> Result<(), String> {
     const FORMAT_PATCHES: [(&str, &str); 2] = [
         (
             "PP",
@@ -2940,10 +3287,12 @@ unsafe fn ensure_known_missing_format_headers(hdr: *mut ffi::bcf_hdr_t) -> Resul
         if ffi::bcf_hdr_append(hdr, cline.as_ptr()) < 0 {
             return Err(format!("failed to inject missing FORMAT header for {}", id));
         }
-        eprintln!(
-            "[W::vcf_parse_format_header] FORMAT '{}' is not defined in the header; injecting compatibility definition",
-            id
-        );
+        if log.enabled(LogLevel::Warn) {
+            eprintln!(
+                "[W::vcf_parse_format_header] FORMAT '{}' is not defined in the header; injecting compatibility definition",
+                id
+            );
+        }
         changed = true;
     }
     if changed && ffi::bcf_hdr_sync(hdr) < 0 {
@@ -3130,6 +3479,18 @@ mod tests {
             .write_cache_file(&bad_cache, fp)
             .expect_err("invalid compiled store must not be cached");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn cache_tmp_path_is_unique_per_write_attempt() {
+        let cache = std::env::temp_dir()
+            .join("consensus_rs_vcf_store")
+            .join("same.vcf.gz.cvcf");
+        let first = VcfStore::tmp_cache_path(&cache);
+        let second = VcfStore::tmp_cache_path(&cache);
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains(".tmp"));
+        assert!(second.to_string_lossy().contains(".tmp"));
     }
 
     #[test]

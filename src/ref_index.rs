@@ -10,6 +10,7 @@
 //!   * The Python API / script pass **1-based** regions; convert at the boundary.
 
 use crate::htslib_ffi::FaidxHandle;
+use crate::logging::ensure_default_htslib_log_level;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -26,6 +27,7 @@ pub struct RefIndex {
 impl RefIndex {
     /// Load a reference FASTA, building `.fai` if absent.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
+        ensure_default_htslib_log_level();
         let path = path.into();
         let handle = FaidxHandle::load(path.to_str().ok_or("non-UTF8 ref path")?)
             .ok_or_else(|| format!("fai_load failed for {}", path.display()))?;

@@ -20,6 +20,7 @@ pub mod engine;
 pub mod haplotype;
 pub mod htslib_ffi;
 pub mod iupac;
+pub mod logging;
 pub mod mask;
 pub mod planner;
 pub mod ref_index;

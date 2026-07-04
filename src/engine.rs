@@ -10,22 +10,24 @@
 
 use crate::apply::{
     apply_region_planned_set, apply_region_planned_set_profile, apply_region_planned_slice_profile,
-    force_fallback_state_machine, ApplyOptions, TO_LOWER, TO_UPPER,
+    force_fallback_state_machine, ApplyErrorMode, ApplyOptions, ApplyState, TO_LOWER, TO_UPPER,
 };
 use crate::chain::Chain;
 use crate::compiled::{
     allele_case_flags, RecordFlags, ALLELE_HAS_ASCII_LOWER, ALLELE_HAS_ASCII_UPPER,
 };
 use crate::haplotype::{HaplotypeSpec, SampleMode};
+use crate::logging::{LogControl, LogLevel};
 use crate::planner::{plan_region_set, PlanOptions, RegionPlan};
 use crate::ref_index::RefIndex;
-use crate::stats::{FallbackReason, FastPathLane, RuntimeStats};
-use crate::vcf_store::{LoadStrategy, RecordSet, VcfStore};
+use crate::stats::{ApplyFailureKind, FallbackReason, FastPathLane, RuntimeStats};
+use crate::vcf_store::{RecordSet, VcfStore};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// One production task: a region + how to pick alleles for it.
 #[derive(Clone)]
@@ -65,6 +67,7 @@ struct CachedOutput {
     seq: Vec<u8>,
     chain: Option<String>,
     error: Option<String>,
+    failure_kind: Option<ApplyFailureKind>,
 }
 
 struct RefOnlyBatchPatch<'a> {
@@ -127,32 +130,49 @@ pub struct ConsensusResult {
     pub seq: Vec<u8>,
     pub chain: Option<String>,
     pub error: Option<String>,
+    pub failure_kind: Option<ApplyFailureKind>,
 }
 
 /// Aggregate over produced consensus results for blackhole/throughput runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsensusRunStats {
     pub n: usize,
+    pub failed: usize,
     pub total_len: u64,
     pub min_len: usize,
     pub max_len: usize,
+    pub first_error: Option<String>,
 }
 
 impl Default for ConsensusRunStats {
     fn default() -> Self {
         ConsensusRunStats {
             n: 0,
+            failed: 0,
             total_len: 0,
             min_len: usize::MAX,
             max_len: 0,
+            first_error: None,
         }
     }
 }
 
 impl ConsensusRunStats {
-    fn observe(&mut self, result: ConsensusResult) -> Result<(), String> {
+    fn observe(
+        &mut self,
+        result: ConsensusResult,
+        error_mode: ApplyErrorMode,
+    ) -> Result<(), String> {
         if let Some(err) = result.error {
-            return Err(format!("{}: {}", result.gene_id, err));
+            self.failed += 1;
+            let msg = format!("{}: {}", result.gene_id, err);
+            if self.first_error.is_none() {
+                self.first_error = Some(msg.clone());
+            }
+            if error_mode.is_error() {
+                return Err(msg);
+            }
+            return Ok(());
         }
         let len = result.seq.len();
         self.n += 1;
@@ -163,13 +183,17 @@ impl ConsensusRunStats {
     }
 
     fn merge(&mut self, other: ConsensusRunStats) {
-        if other.n == 0 {
+        if other.n == 0 && other.failed == 0 {
             return;
         }
         self.n += other.n;
+        self.failed += other.failed;
         self.total_len += other.total_len;
         self.min_len = self.min_len.min(other.min_len);
         self.max_len = self.max_len.max(other.max_len);
+        if self.first_error.is_none() {
+            self.first_error = other.first_error;
+        }
     }
 
     fn finish(mut self) -> Self {
@@ -193,10 +217,17 @@ pub struct ConsensusRunProfile {
 }
 
 impl ConsensusRunProfile {
-    fn observe_result(&mut self, result: ConsensusResult) -> Result<(), String> {
+    fn observe_result(
+        &mut self,
+        result: ConsensusResult,
+        error_mode: ApplyErrorMode,
+    ) -> Result<(), String> {
+        if let Some(kind) = result.failure_kind {
+            self.runtime.observe_apply_failure(kind);
+        }
         self.runtime
             .observe_alloc_bytes(u64::try_from(result.seq.len()).unwrap_or(u64::MAX));
-        self.run.observe(result)
+        self.run.observe(result, error_mode)
     }
 
     fn merge(&mut self, other: ConsensusRunProfile) {
@@ -212,6 +243,7 @@ impl ConsensusRunProfile {
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("run.n={}", self.run.n),
+            format!("run.failed={}", self.run.failed),
             format!("run.total_len={}", self.run.total_len),
             format!("run.min_len={}", self.run.min_len),
             format!("run.max_len={}", self.run.max_len),
@@ -263,6 +295,10 @@ pub struct EngineOptions {
     pub mask_with: crate::mask::MaskWith,
     pub chain: bool,
     pub regions_overlap: u8,
+    pub apply_error_mode: ApplyErrorMode,
+    /// None or Some(0) = all available load workers, capped by VCF count.
+    pub compile_threads: Option<usize>,
+    pub log_level: LogLevel,
     /// 0 = unlimited; otherwise split each region/VCF group into chunks of at
     /// most this many tasks.
     pub max_tasks_per_group: usize,
@@ -275,7 +311,14 @@ pub struct ConsensusEngine {
     ref_index: Arc<RefIndex>,
     vcfs: Arc<HashMap<String, Arc<VcfStore>>>,
     mask: Option<Arc<crate::mask::Mask>>,
+    log: Arc<LogControl>,
     opts: EngineOptions,
+}
+
+pub(crate) struct VcfLoadGroup {
+    pub keys: Vec<String>,
+    pub path: PathBuf,
+    pub label: String,
 }
 
 impl ConsensusEngine {
@@ -288,7 +331,26 @@ impl ConsensusEngine {
         vcfs: HashMap<String, VcfStore>,
         opts: EngineOptions,
     ) -> Result<Self, String> {
+        let log = Arc::new(LogControl::new(opts.log_level));
+        Self::try_new_with_log(ref_index, vcfs, opts, log)
+    }
+
+    fn try_new_with_log(
+        ref_index: RefIndex,
+        vcfs: HashMap<String, VcfStore>,
+        opts: EngineOptions,
+        log: Arc<LogControl>,
+    ) -> Result<Self, String> {
         let vcfs = vcfs.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        Self::try_new_arc_with_log(ref_index, vcfs, opts, log)
+    }
+
+    fn try_new_arc_with_log(
+        ref_index: RefIndex,
+        vcfs: HashMap<String, Arc<VcfStore>>,
+        opts: EngineOptions,
+        log: Arc<LogControl>,
+    ) -> Result<Self, String> {
         let mask = match &opts.mask {
             Some(path) => Some(Arc::new(crate::mask::Mask::load(path, opts.mask_with)?)),
             None => None,
@@ -297,6 +359,7 @@ impl ConsensusEngine {
             ref_index: Arc::new(ref_index),
             vcfs: Arc::new(vcfs),
             mask,
+            log,
             opts,
         })
     }
@@ -307,12 +370,61 @@ impl ConsensusEngine {
         vcf_paths: HashMap<String, PathBuf>,
         opts: EngineOptions,
     ) -> Result<Self, String> {
+        let log = Arc::new(LogControl::new(opts.log_level));
+        let total_t0 = Instant::now();
+        let ref_t0 = Instant::now();
         let ref_index = RefIndex::load(ref_path)?;
-        let mut vcfs = HashMap::new();
-        for (k, p) in vcf_paths {
-            vcfs.insert(k, VcfStore::load_with_strategy(p, LoadStrategy::Eager)?);
+        let ref_sec = ref_t0.elapsed().as_secs_f64();
+
+        let groups = group_vcf_loads(vcf_paths.into_iter().collect());
+        let vcf_count: usize = groups.iter().map(|group| group.keys.len()).sum();
+        let unique_vcf_count = groups.len();
+        let load_threads = compile_thread_count(opts.compile_threads, unique_vcf_count);
+        if log.enabled(LogLevel::Info) {
+            eprintln!(
+                "pyconsensus info: engine_load_start vcf_count={} unique_vcf_count={} compile_threads={} ref_sec={:.3}",
+                vcf_count, unique_vcf_count, load_threads, ref_sec
+            );
         }
-        ConsensusEngine::try_new(ref_index, vcfs, opts)
+
+        let vcf_t0 = Instant::now();
+        let vcfs: HashMap<String, Arc<VcfStore>> = if unique_vcf_count == 0 {
+            HashMap::new()
+        } else {
+            let pool = thread_pool(load_threads);
+            let loaded: Result<Vec<(Vec<String>, Arc<VcfStore>)>, String> = pool.install(|| {
+                groups
+                    .into_par_iter()
+                    .map(|group| {
+                        match VcfStore::load_with_log(&group.path, Some(&group.label), log.as_ref())
+                        {
+                            Ok(store) => Ok((group.keys, Arc::new(store))),
+                            Err(err) => Err(format!("VCF key '{}': {}", group.label, err)),
+                        }
+                    })
+                    .collect()
+            });
+            let mut vcfs = HashMap::with_capacity(vcf_count);
+            for (keys, store) in loaded? {
+                for key in keys {
+                    vcfs.insert(key, store.clone());
+                }
+            }
+            vcfs
+        };
+        let vcf_sec = vcf_t0.elapsed().as_secs_f64();
+        if log.enabled(LogLevel::Info) {
+            eprintln!(
+                "pyconsensus info: engine_load_done vcf_count={} unique_vcf_count={} compile_threads={} ref_sec={:.3} vcf_sec={:.3} total_sec={:.3}",
+                vcf_count,
+                unique_vcf_count,
+                load_threads,
+                ref_sec,
+                vcf_sec,
+                total_t0.elapsed().as_secs_f64()
+            );
+        }
+        ConsensusEngine::try_new_arc_with_log(ref_index, vcfs, opts, log)
     }
 
     /// Run all tasks in parallel, returning results in input order.
@@ -377,7 +489,7 @@ impl ConsensusEngine {
                 .map(|group| {
                     let mut stats = ConsensusRunStats::default();
                     for (_, result) in engine.run_group(&tasks, group) {
-                        stats.observe(result)?;
+                        stats.observe(result, engine.opts.apply_error_mode)?;
                     }
                     Ok(stats)
                 })
@@ -445,6 +557,7 @@ impl ConsensusEngine {
                 seq: Vec::new(),
                 chain: None,
                 error: Some(err),
+                failure_kind: None,
             }
         };
 
@@ -492,14 +605,7 @@ impl ConsensusEngine {
                 Some(&mut chain),
                 Some(&plan),
             );
-            ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain: Some(chain.render()),
-                error: None,
-            }
+            result_from_state(task, state, Some(chain.render()))
         } else {
             let state = apply_region_planned_set(
                 &task.chr,
@@ -510,14 +616,7 @@ impl ConsensusEngine {
                 None,
                 Some(&plan),
             );
-            ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain: None,
-                error: None,
-            }
+            result_from_state(task, state, None)
         }
     }
 
@@ -679,7 +778,7 @@ impl ConsensusEngine {
                 u64::try_from(records.len()).unwrap_or(u64::MAX),
             );
             for (_, result) in batch {
-                profile.observe_result(result)?;
+                profile.observe_result(result, self.opts.apply_error_mode)?;
             }
             return Ok(profile);
         }
@@ -690,7 +789,7 @@ impl ConsensusEngine {
             for (_, result) in
                 self.run_empty_group(tasks, group, &ref_seq, ori_pos, shared_mask.as_deref())
             {
-                profile.observe_result(result)?;
+                profile.observe_result(result, self.opts.apply_error_mode)?;
             }
             return Ok(profile);
         }
@@ -705,7 +804,10 @@ impl ConsensusEngine {
             let cache_key = if cache_enabled {
                 let key = task_exec_key(task);
                 if let Some(cached) = output_cache.get(&key) {
-                    profile.observe_result(result_from_cached(task, cached))?;
+                    profile.observe_result(
+                        result_from_cached(task, cached),
+                        self.opts.apply_error_mode,
+                    )?;
                     continue;
                 }
                 Some(key)
@@ -763,7 +865,7 @@ impl ConsensusEngine {
             if let Some(key) = cache_key {
                 output_cache.insert(key, CachedOutput::from(&observed.result));
             }
-            profile.observe_result(observed.result)?;
+            profile.observe_result(observed.result, self.opts.apply_error_mode)?;
         }
         Ok(profile)
     }
@@ -813,6 +915,7 @@ impl ConsensusEngine {
                     seq: seq_out,
                     chain: chain.clone(),
                     error: None,
+                    failure_kind: None,
                 },
             ));
         }
@@ -853,14 +956,7 @@ impl ConsensusEngine {
                 Some(&mut chain),
                 Some(plan),
             );
-            ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain: Some(chain.render()),
-                error: None,
-            }
+            result_from_state(task, state, Some(chain.render()))
         } else {
             let state = apply_region_planned_set(
                 &task.chr,
@@ -871,14 +967,7 @@ impl ConsensusEngine {
                 None,
                 Some(plan),
             );
-            ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain: None,
-                error: None,
-            }
+            result_from_state(task, state, None)
         }
     }
 
@@ -929,14 +1018,7 @@ impl ConsensusEngine {
             );
             (state, None)
         };
-        ConsensusResult {
-            gene_id: task.gene_id.clone(),
-            sample: task.sample.clone(),
-            haplotype: task.haplotype.clone(),
-            seq: state.buf,
-            chain,
-            error: None,
-        }
+        result_from_state(task, state, chain)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -989,14 +1071,7 @@ impl ConsensusEngine {
         let napplied = state.napplied;
         let fallback_reason = state.fallback_reason;
         ProfiledTaskResult {
-            result: ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain,
-                error: None,
-            },
+            result: result_from_state(task, state, chain),
             lane,
             napplied,
             fallback_reason,
@@ -1053,14 +1128,7 @@ impl ConsensusEngine {
         let napplied = state.napplied;
         let fallback_reason = state.fallback_reason;
         ProfiledTaskResult {
-            result: ConsensusResult {
-                gene_id: task.gene_id.clone(),
-                sample: task.sample.clone(),
-                haplotype: task.haplotype.clone(),
-                seq: state.buf,
-                chain,
-                error: None,
-            },
+            result: result_from_state(task, state, chain),
             lane,
             napplied,
             fallback_reason,
@@ -1870,6 +1938,22 @@ impl ConsensusEngine {
         self.opts.chain
     }
 
+    pub fn apply_error_mode(&self) -> ApplyErrorMode {
+        self.opts.apply_error_mode
+    }
+
+    pub fn log_level(&self) -> LogLevel {
+        self.log.level()
+    }
+
+    pub fn set_log_level(&self, level: LogLevel) {
+        self.log.set_level(level);
+    }
+
+    pub fn log_control(&self) -> Arc<LogControl> {
+        self.log.clone()
+    }
+
     /// Launch a lazy iterator over results using a producer-consumer model.
     ///
     /// A rayon thread pool (`threads` workers) consumes region groups from an
@@ -1982,7 +2066,7 @@ impl ConsensusEngine {
         let mut iter = self.consensus_iter(tasks, prefetch_steps, warmup, ordered, threads);
         let mut stats = ConsensusRunStats::default();
         while let Some((_, result)) = iter.next_blocking() {
-            stats.observe(result)?;
+            stats.observe(result, self.opts.apply_error_mode)?;
         }
         Ok(stats.finish())
     }
@@ -2410,6 +2494,7 @@ impl From<&ConsensusResult> for CachedOutput {
             seq: result.seq.clone(),
             chain: result.chain.clone(),
             error: result.error.clone(),
+            failure_kind: result.failure_kind,
         }
     }
 }
@@ -2422,6 +2507,7 @@ fn result_from_cached(task: &ConsensusTask, cached: &CachedOutput) -> ConsensusR
         seq: cached.seq.clone(),
         chain: cached.chain.clone(),
         error: cached.error.clone(),
+        failure_kind: cached.failure_kind,
     }
 }
 
@@ -2480,6 +2566,7 @@ fn finish_batch_outputs(
                 seq,
                 chain: None,
                 error: None,
+                failure_kind: None,
             },
         ));
     }
@@ -2592,14 +2679,111 @@ fn error_result(task: &ConsensusTask, err: String) -> ConsensusResult {
         seq: Vec::new(),
         chain: None,
         error: Some(err),
+        failure_kind: None,
     }
 }
 
-fn thread_pool(n: usize) -> rayon::ThreadPool {
+fn result_from_state(
+    task: &ConsensusTask,
+    state: ApplyState,
+    chain: Option<String>,
+) -> ConsensusResult {
+    let ApplyState { buf, failed, .. } = state;
+    match failed {
+        Some(failure) => ConsensusResult {
+            gene_id: task.gene_id.clone(),
+            sample: task.sample.clone(),
+            haplotype: task.haplotype.clone(),
+            seq: Vec::new(),
+            chain: None,
+            error: Some(failure.message),
+            failure_kind: Some(failure.kind),
+        },
+        None => ConsensusResult {
+            gene_id: task.gene_id.clone(),
+            sample: task.sample.clone(),
+            haplotype: task.haplotype.clone(),
+            seq: buf,
+            chain,
+            error: None,
+            failure_kind: None,
+        },
+    }
+}
+
+pub(crate) fn thread_pool(n: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .build()
         .expect("failed to build rayon pool")
+}
+
+pub(crate) fn compile_thread_count(requested: Option<usize>, n_vcfs: usize) -> usize {
+    if n_vcfs == 0 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    match requested {
+        Some(n) if n > 0 => n.min(n_vcfs).max(1),
+        _ => available.min(n_vcfs).max(1),
+    }
+}
+
+pub(crate) fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+pub(crate) fn normalize_path_for_dedup(path: &Path) -> PathBuf {
+    let absolute = absolute_path(path);
+    if let Ok(canonical) = absolute.canonicalize() {
+        return canonical;
+    }
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => absolute,
+    }
+}
+
+pub(crate) fn cache_dedupe_key(path: &Path) -> PathBuf {
+    normalize_path_for_dedup(&VcfStore::default_cache_path_for(path))
+}
+
+pub(crate) fn group_vcf_loads(mut items: Vec<(String, PathBuf)>) -> Vec<VcfLoadGroup> {
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut by_cache: HashMap<PathBuf, usize> = HashMap::new();
+    let mut groups: Vec<VcfLoadGroup> = Vec::new();
+    for (key, path) in items {
+        let cache_key = cache_dedupe_key(&path);
+        if let Some(&idx) = by_cache.get(&cache_key) {
+            groups[idx].keys.push(key);
+        } else {
+            by_cache.insert(cache_key, groups.len());
+            groups.push(VcfLoadGroup {
+                keys: vec![key],
+                path,
+                label: String::new(),
+            });
+        }
+    }
+    for group in &mut groups {
+        group.label = match group.keys.as_slice() {
+            [] => String::new(),
+            [key] => key.clone(),
+            [first, rest @ ..] => format!("{}(+{})", first, rest.len()),
+        };
+    }
+    groups
 }
 
 #[cfg(test)]
@@ -2643,6 +2827,25 @@ mod tests {
             "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=100>\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
              chr1\t2\t.\tC\tG\t.\t.\t.\n\
+             chr1\t10\t.\tC\tA\t.\t.\t.\n",
+        )
+        .unwrap();
+        (ref_fa, vcf)
+    }
+
+    fn setup_ref_mismatch(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("consensus_rs_engine_test_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let ref_fa = dir.join("ref.fa");
+        std::fs::write(&ref_fa, format!(">chr1\n{}\n", seq)).unwrap();
+        let vcf = dir.join("v.vcf");
+        std::fs::write(
+            &vcf,
+            "##fileformat=VCFv4.3\n##contig=<ID=chr1,length=100>\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chr1\t2\t.\tT\tG\t.\t.\t.\n\
              chr1\t10\t.\tC\tA\t.\t.\t.\n",
         )
         .unwrap();
@@ -2841,6 +3044,42 @@ mod tests {
         assert_eq!(parse_haplotype_index_no_alloc("R"), None);
         assert_eq!(parse_haplotype_index_no_alloc("0"), None);
         assert_eq!(parse_haplotype_index_no_alloc("1x"), None);
+    }
+
+    #[test]
+    fn compile_thread_count_zero_and_none_use_auto_capped_by_vcf_count() {
+        assert_eq!(compile_thread_count(Some(1), 4), 1);
+        assert_eq!(compile_thread_count(Some(64), 2), 2);
+        assert_eq!(compile_thread_count(None, 0), 1);
+
+        let auto_zero = compile_thread_count(Some(0), 2);
+        let auto_none = compile_thread_count(None, 2);
+        assert!((1..=2).contains(&auto_zero));
+        assert!((1..=2).contains(&auto_none));
+        assert_eq!(auto_zero, auto_none);
+    }
+
+    #[test]
+    fn group_vcf_loads_deduplicates_same_cache_path() {
+        let dir = std::env::temp_dir().join("consensus_rs_engine_group_loads");
+        let nested = dir.join("nested");
+        let _ = std::fs::create_dir_all(&nested);
+        let path = dir.join("same.vcf.gz");
+        let groups = group_vcf_loads(vec![
+            ("b".to_string(), path.clone()),
+            ("a".to_string(), path.clone()),
+            ("c".to_string(), nested.join("..").join("same.vcf.gz")),
+            ("z".to_string(), dir.join("other.vcf.gz")),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(groups[0].label, "a(+2)");
+        assert_eq!(groups[1].keys, vec!["z".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3117,6 +3356,77 @@ mod tests {
             .consensus_iter_stats(tasks, 1, true, false, 4)
             .unwrap();
         assert_eq!(iter, many);
+    }
+
+    #[test]
+    fn consensus_many_marks_ref_mismatch_failed_without_stopping_batch() {
+        let (ref_fa, vcf) = setup_ref_mismatch("ref_mismatch_batch");
+        let strict_ref_fa = ref_fa.clone();
+        let strict_vcf = vcf.clone();
+        let mut vcf_map = HashMap::new();
+        vcf_map.insert("chr1".to_string(), vcf);
+        let engine = ConsensusEngine::load(ref_fa, vcf_map, EngineOptions::default()).unwrap();
+        let tasks = vec![
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 1,
+                end: 8,
+                vcf_key: "chr1".into(),
+                gene_id: "bad".into(),
+                sample: None,
+                haplotype: None,
+            },
+            ConsensusTask {
+                chr: "chr1".into(),
+                start: 9,
+                end: 12,
+                vcf_key: "chr1".into(),
+                gene_id: "good".into(),
+                sample: None,
+                haplotype: None,
+            },
+        ];
+
+        let results = engine.consensus_many(tasks.clone(), 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].gene_id, "bad");
+        assert_eq!(results[0].failure_kind, Some(ApplyFailureKind::RefMismatch));
+        assert!(results[0].error.as_deref().unwrap().contains("REF allele"));
+        assert!(results[0].seq.is_empty());
+        assert_eq!(results[1].gene_id, "good");
+        assert!(results[1].error.is_none(), "{:?}", results[1].error);
+        assert_eq!(results[1].seq, b"AAGT");
+
+        let stats = engine.consensus_many_stats(tasks.clone(), 2).unwrap();
+        assert_eq!(stats.as_tuple(), (1, 4, 4, 4));
+        assert_eq!(stats.failed, 1);
+        assert!(stats.first_error.as_deref().unwrap().contains("bad"));
+
+        let profile = engine.consensus_many_profile(tasks.clone(), 2).unwrap();
+        assert_eq!(profile.run.failed, 1);
+        assert_eq!(
+            profile
+                .runtime
+                .apply_failure_count(ApplyFailureKind::RefMismatch),
+            1
+        );
+
+        let mut strict_vcf_map = HashMap::new();
+        strict_vcf_map.insert("chr1".to_string(), strict_vcf);
+        let strict_engine = ConsensusEngine::load(
+            strict_ref_fa,
+            strict_vcf_map,
+            EngineOptions {
+                apply_error_mode: ApplyErrorMode::Error,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = strict_engine
+            .consensus_many_stats(tasks, 2)
+            .expect_err("strict mode should return Err for failed tasks");
+        assert!(err.contains("bad"));
     }
 
     #[test]
