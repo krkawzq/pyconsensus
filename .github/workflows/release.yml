@@ -40,11 +40,11 @@ jobs:
           # manylinux_2_28 (glibc 2.28) is the newest x86_64 image maturin-action
           # provisions; broader compatibility than 2_34 and matches what PyO3
           # publishes. build.rs compiles htslib + the 5 compression libs from
-          # source with -fPIC, so we only need autotools/cmake in the container.
+          # source with -fPIC, so the container only needs the build toolchain
+          # (autotools + cmake + gcc) — no -devel packages required.
           manylinux: "2_28"
           before-script-linux: |
-            yum install -y autoconf automake libtool make gcc cmake \
-              zlib-devel bzip2-devel xz-devel zstd-devel
+            yum install -y autoconf automake libtool make gcc cmake
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
